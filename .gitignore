@@ -1,0 +1,22 @@
+# Build outputs
+/build/
+/out/
+/cmake-build-*/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+CMakeSettings.json
+
+# Compiled binaries (distribute them through GitHub Releases)
+*.dll
+*.lib
+*.exp
+*.pdb
+*.obj
+*.ilk
+
+# Runtime logs
+*.log

@@ -1,0 +1,118 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+      - '[0-9]+*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build d3dcompiler_47.dll (x64 Release)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout (with MinHook submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure (CMake, MSVC x64)
+        run: cmake -S . -B build -A x64
+
+      - name: Build (Release)
+        run: cmake --build build --config Release --parallel
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME
+          } else {
+            $version = "dev-$($env:GITHUB_SHA.Substring(0, 7))"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $pkgName = "StormConnections_Netcode_$version"
+          $pkgDir  = Join-Path 'dist' $pkgName
+          New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
+
+          Copy-Item 'build/Release/d3dcompiler_47.dll' $pkgDir
+          Copy-Item 'netcode_config.ini'               $pkgDir
+          Copy-Item 'README.md'                        $pkgDir
+          Copy-Item 'LICENSE'                          $pkgDir
+
+          $zip = "dist/$pkgName.zip"
+          Compress-Archive -Path "$pkgDir/*" -DestinationPath $zip -Force
+
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $pkgName.zip" | Out-File -Encoding ascii "$zip.sha256"
+          $dllHash = (Get-FileHash "$pkgDir/d3dcompiler_47.dll" -Algorithm SHA256).Hash.ToLower()
+
+          "zip=$zip"         >> $env:GITHUB_OUTPUT
+          "pkgdir=$pkgDir"   >> $env:GITHUB_OUTPUT
+          "dllhash=$dllHash" >> $env:GITHUB_OUTPUT
+          "ziphash=$hash"    >> $env:GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StormConnections_Netcode_${{ steps.version.outputs.version }}
+          path: ${{ steps.package.outputs.pkgdir }}
+
+      - name: Extract release notes from CHANGELOG.md
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          DLL_HASH: ${{ steps.package.outputs.dllhash }}
+          ZIP_HASH: ${{ steps.package.outputs.ziphash }}
+        run: |
+          $tag     = $env:GITHUB_REF_NAME
+          $version = $tag.TrimStart('v')
+          $lines   = Get-Content 'CHANGELOG.md' -Encoding utf8
+          $notes   = New-Object System.Collections.Generic.List[string]
+          $inside  = $false
+          foreach ($line in $lines) {
+            if ($line -match '^## \[?v?([0-9][^\] ]*)') {
+              if ($inside) { break }
+              if ($Matches[1] -eq $version) { $inside = $true; continue }
+            }
+            if ($inside) { $notes.Add($line) }
+          }
+          if ($notes.Count -eq 0) { $notes.Add("Release $tag") }
+          $notes.Add('')
+          $notes.Add('---')
+          $notes.Add('')
+          $notes.Add('### Sommes de contrôle (SHA-256)')
+          $notes.Add('')
+          $notes.Add('| Fichier | SHA-256 |')
+          $notes.Add('| :--- | :--- |')
+          $notes.Add("| ``d3dcompiler_47.dll`` | ``$($env:DLL_HASH)`` |")
+          $notes.Add("| ``StormConnections_Netcode_$tag.zip`` | ``$($env:ZIP_HASH)`` |")
+          $notes -join "`n" | Out-File -Encoding utf8 'RELEASE_NOTES.md'
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Storm Connections Netcode ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.zip }}.sha256
+            ${{ steps.package.outputs.pkgdir }}/d3dcompiler_47.dll
+            ${{ steps.package.outputs.pkgdir }}/netcode_config.ini
+          make_latest: true
