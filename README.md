@@ -1,4 +1,4 @@
-# Storm Connections — Online Crash Fix & Netcode Overhaul (v2.6)
+# Storm Connections — Online Crash Fix & Netcode Overhaul (v2.7)
 
 Correctif de crash en ligne et refonte du netcode pour **NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS** (PC / Steam).
 
@@ -13,6 +13,7 @@ Correctif de crash en ligne et refonte du netcode pour **NARUTO X BORUTO Ultimat
 
 ## Sommaire
 
+- [Nouveautés de la v2.7](#-nouveautés-de-la-v27)
 - [Fonctionnalités](#-fonctionnalités)
 - [Comment ça fonctionne](#-comment-ça-fonctionne)
 - [Hôte, client et compatibilité](#-hôte-client-et-compatibilité)
@@ -27,19 +28,36 @@ Correctif de crash en ligne et refonte du netcode pour **NARUTO X BORUTO Ultimat
 
 ---
 
+## 🆕 Nouveautés de la v2.7
+
+Mise à jour axée sur la **stabilité en spectateur**, la **compatibilité universelle** et la **latence minimale** dans tous les scénarios. Le détail complet est dans le [`CHANGELOG`](CHANGELOG.md).
+
+- **Mode spectateur** : fin des « connexion à l'adversaire perdue » et des micro-gels (garde de chargement initial, NACK cadencés, redondance du flux spectateur).
+- **Compatibilité totale** : moddé / non-moddé × hôte / client × 30 / 60 FPS × matchmaking, parties personnalisées, tournois et ligues.
+- **Hôte moddé spectateur** de deux joueurs (même non-moddés) : le délai optimal est calculé et imposé aux deux combattants.
+- **Premier match sans gel** entre deux joueurs moddés, y compris à la revanche.
+- **Courbe de délai à 3 paliers** (2/2, 1/2 ou 0/2 combattants moddés) sans double pénalité de distance.
+- **Mode 30 FPS** : marge de phase dédiée et auto-ajustement plafonné à +1 frame.
+- **Anti-flood UDP** pendant les gels et **Fast NACK cadencé sur le vrai ping** (plus de saturation de la file de renvoi d'un adversaire sans mod).
+- **Pré-chauffage du canal Steam P2P** (canal 6) avant la frame 0 de chaque combat.
+- **Nouveau correctif de crash** dans le lobby de partie personnalisée (`NSUNSC.exe+0x113D7F2`).
+- **Code source modulaire** : 9 fichiers de 700 lignes maximum chacun.
+
+---
+
 ## ✨ Fonctionnalités
 
 | # | Fonctionnalité | Effet |
 | :-- | :--- | :--- |
-| 1 | **Correctif des crashs en ligne** (`0xC0000005`) | Supprime les crashs liés à la lecture des pseudos Steam (`NSUNSC.exe+0x10BAD24` et `+0x0847A67`) et au pool de renvoi de paquets (`+0x10F1455` et `+0x10F2928`). |
+| 1 | **Correctif des crashs en ligne** (`0xC0000005`) | Supprime les crashs liés à la lecture des pseudos Steam (`NSUNSC.exe+0x10BAD24` et `+0x0847A67`) au pool de renvoi de paquets (`+0x10F1455` et `+0x10F2928`) et au lobby de partie personnalisée (`+0x113D7F2`). |
 | 2 | **Délai d'entrée « aller simple » (OWD)** | Remplace la formule du jeu (`1,25 × ping` complet) par la latence réelle aller simple (`ping / 2`) + une petite marge anti-gigue. Jusqu'à **1 frame (16,7 ms)** entre deux joueurs équipés du mod. |
 | 3 | **Négociation automatique (handshake `NC`)** | Les deux jeux se reconnaissent entre eux et se mettent d'accord sur le même délai. Reste compatible avec les joueurs sans mod. |
 | 4 | **Redondance des paquets UDP** | Chaque paquet contient aussi les 3 frames précédentes : si un paquet se perd, le suivant comble le trou sans gel. |
-| 5 | **Récupération rapide des pertes (Fast NACK)** | Redemande les frames manquantes après 3 frames de blocage (50 ms) au lieu d'attendre bien plus longtemps. |
+| 5 | **Récupération rapide des pertes (Fast NACK)** | Redemande les frames manquantes après 2 frames de blocage (33 ms), avec relance espacée selon le vrai ping pour ne jamais saturer l'adversaire. |
 | 6 | **Rendu DirectX 11 sans file d'attente** | Force `SetMaximumFrameLatency(1)` : environ **-33 ms** (2 frames) de latence d'affichage locale, en ligne comme hors ligne. |
 | 7 | **Boost du planificateur Windows** | Désactive EcoQoS / Timer-Coalescing (Windows 11), timer noyau à 1 ms et priorité MMCSS « Games » pour un rythme d'images stable. |
 | 8 | **Mode Wi-Fi gaming** | Bloque le scan Wi-Fi de fond de Windows (toutes les ~65 s, source de pics de ping) pendant que le jeu tourne. Restauré automatiquement à la fermeture. |
-| 9 | **Auto-ajustement en revanche** | Si le match précédent contre le même adversaire a eu trop de micro-gels (≥ 3 % / ≥ 18 %), ajoute +1 / +2 frames de marge au match suivant. |
+| 9 | **Auto-ajustement en revanche** | Si le match précédent contre le même adversaire a eu trop de micro-gels (≥ 1,8 % / ≥ 12 %), ajoute +1 / +2 frames de marge au match suivant (+1 max en 30 FPS). |
 | 10 | **Masquage de la fenêtre « Communication en cours... »** | La fenêtre sombre n'apparaît plus sur les micro-coupures (< 3 s). |
 
 ---
@@ -63,7 +81,7 @@ Le jeu charge au démarrage la bibliothèque Microsoft `d3dcompiler_47.dll`. Le 
 
 Avant de toucher une fonction du jeu, le mod compare ses premiers octets avec ceux attendus pour la version 1.71 :
 
-- **14 hooks** (1 rendu + 3 crash-fix + 10 netcode) et **3 patchs d'octets** vérifiés individuellement.
+- **16 hooks** (1 rendu + 3 crash-fix + 12 netcode), **5 patchs d'octets** et 1 pont de correction du lobby, vérifiés individuellement.
 - Si les octets ne correspondent pas (autre version du jeu), ce correctif est **ignoré** au lieu de risquer un crash.
 
 ### Le problème du netcode d'origine
@@ -98,6 +116,7 @@ C'est le jeu (via les lobbies Steam) qui décide qui est l'hôte : en général,
 | :--- | :--- | :--- | :--- |
 | Moddé (hôte **ou** client) | **Moddé** | ✅ Optimal, jusqu'à 1 frame | ✅ Toutes |
 | Moddé, **hôte** | Sans mod | ✅ Optimal, minimum 2 frames | ✅ Toutes |
+| Moddé, **hôte spectateur** | 2 joueurs, moddés ou non | ✅ Délai optimal imposé aux deux combattants (minimum 3 frames si aucun n'est moddé) | ✅ Toutes |
 | Moddé, **client** | Sans mod, hôte | ⚠️ Délai d'origine du jeu (imposé par l'hôte) | ✅ Crash-fix, redondance, rendu, Wi-Fi |
 
 > [!TIP]
@@ -153,7 +172,7 @@ Au lancement, une **console noire** s'ouvre à côté du jeu (désactivable, voi
 
 | Message | Signification |
 | :--- | :--- |
-| `[Init] 14/14 .pdata-verified hooks active.` | Tout est actif. **Moins de 14** = version du jeu différente de 1.71. |
+| `[Init] 16/16 .pdata-verified hooks active.` | Tout est actif. **Moins de 16** = version du jeu différente de 1.71. |
 | `[LowLatency] DXGI MaxFrameLatency: 3 -> 1 f ...` | Rendu sans file d'attente actif (s'affiche au premier rendu). |
 | `[Scheduler] Gaming Boost active: ...` | Boost du planificateur Windows actif. |
 | `[WiFi-AntiLag] Active on "..."` | Mode Wi-Fi gaming actif (uniquement si vous êtes en Wi-Fi). |
@@ -192,7 +211,7 @@ Ouvrez le fichier avec le Bloc-notes. `1` = activé, `0` = désactivé. **Les va
 | `ForcedDelayFrames` | `-1` | `-1` = adaptatif selon le ping. `1` à `16` = délai fixe. |
 | `MinDelayFrames` | `1` | Délai minimal (1 frame = 16,67 ms). Contre un joueur sans mod, le plancher reste 2. |
 | `MaxDelayClamp` | `16` | Délai maximal autorisé. |
-| `JitterMarginMs` | `8` | Marge de sécurité anti-gigue (en ms), plus RTT/12 automatiquement. |
+| `JitterMarginMs` | `5` | Marge de sécurité anti-gigue (en ms), plus RTT/20 automatiquement. |
 
 ### `[LowLatencyRender]`
 
@@ -207,7 +226,7 @@ Ouvrez le fichier avec le Bloc-notes. `1` = activé, `0` = désactivé. **Les va
 | Clé | Défaut | Description |
 | :--- | :---: | :--- |
 | `EnablePacketRedundancy` | `1` | Envoie les frames précédentes dans chaque paquet. |
-| `RedundancyFrameDepth` | `3` | Nombre de frames incluses par paquet (1 à 6). |
+| `RedundancyFrameDepth` | `3` | Nombre de frames incluses par paquet (1 à 4). |
 | `MaxResendBatch` | `3` | Frames renvoyées par lot après une perte (1 à 4). |
 
 ### `[JitterAndStallGovernance]`
@@ -217,7 +236,7 @@ Ouvrez le fichier avec le Bloc-notes. `1` = activé, `0` = désactivé. **Les va
 | `EnableWifiGamingMode` | `1` | Bloque le scan Wi-Fi de fond pendant le jeu. |
 | `EnableDynamicPeerAutoTune` | `1` | Ajoute +1 / +2 frames en revanche si le match précédent a eu trop de gels. |
 | `EnableMicroJitterPoll` | `1` | Attente fine des paquets à chaque frame pour absorber la micro-gigue. |
-| `MicroJitterSpinUs` | `850` | Durée de cette attente (µs, 0 à 1500). |
+| `MicroJitterSpinUs` | `1100` | Durée de cette attente (µs, 0 à 2000). |
 | `FastNackRecovery` | `1` | Redemande rapide des frames perdues. |
 | `SuppressShortOverlay` | `1` | Cache la fenêtre « Communication en cours... » sur les coupures courtes. |
 | `OverlayThresholdFrames` | `180` | Durée avant d'afficher cette fenêtre (180 frames = 3 s). |
@@ -227,7 +246,7 @@ Ouvrez le fichier avec le Bloc-notes. `1` = activé, `0` = désactivé. **Les va
 ## ⚠️ Précautions & limites
 
 > [!WARNING]
-> **Mises à jour du jeu.** Le mod est conçu pour la **version 1.71**. Après un patch officiel, les correctifs dont le code a changé sont désactivés automatiquement (la console affiche moins de `14/14`). Le jeu reste jouable, mais le mod ne fonctionne plus qu'en partie. Il faudra attendre une nouvelle version du mod.
+> **Mises à jour du jeu.** Le mod est conçu pour la **version 1.71**. Après un patch officiel, les correctifs dont le code a changé sont désactivés automatiquement (la console affiche moins de `16/16`). Le jeu reste jouable, mais le mod ne fonctionne plus qu'en partie. Il faudra attendre une nouvelle version du mod.
 
 - **Steam peut retirer le mod.** « Vérifier l'intégrité des fichiers du jeu » ou une mise à jour peut remplacer `d3dcompiler_47.dll` par l'original. Recopiez alors la DLL du mod.
 - **Antivirus.** La DLL n'est pas signée et modifie le comportement du jeu en mémoire : certains antivirus (dont Windows Defender) peuvent la signaler. Si vous avez un doute, compilez-la vous-même depuis les sources.
@@ -245,7 +264,7 @@ Ouvrez le fichier avec le Bloc-notes. `1` = activé, `0` = désactivé. **Les va
 | Symptôme | Solution |
 | :--- | :--- |
 | Aucune console au lancement | Vérifiez que `d3dcompiler_47.dll` est bien **à côté de `NSUNSC.exe`** et que `EnableConsole = 1`. Sous Proton, ajoutez l'option de lancement `WINEDLLOVERRIDES`. |
-| `X/14 hooks active` avec X < 14 | La version du jeu n'est pas la 1.71. |
+| `X/16 hooks active` avec X < 16 | La version du jeu n'est pas la 1.71. |
 | Le jeu ne démarre plus | Supprimez `d3dcompiler_47.dll` et renommez `d3dcompiler_47_original.dll` en `d3dcompiler_47.dll` (ou vérifiez l'intégrité des fichiers sur Steam), puis signalez le problème avec votre `storm_netcode.log`. |
 | Gel au tout début du combat | Remettez `DelayMode = 1` et les valeurs par défaut (supprimez le `.ini` pour qu'il soit régénéré). |
 | Saccades fréquentes en combat | Augmentez `JitterMarginMs` (par ex. `12` ou `16`), ou passez en câble Ethernet. |
@@ -290,7 +309,12 @@ Structure du dépôt :
 | `include/netcode_mod.h` | Adresses (RVA) du jeu 1.71, structures internes et configuration partagée. |
 | `src/proxy_d3dcompiler.cpp` | Proxy : charge la vraie `d3dcompiler_47.dll` et relaie ses 29 exports. |
 | `src/dllmain.cpp` | Point d'entrée, lecture/génération du `.ini`, console et journal. |
-| `src/netcode_hooks.cpp` | Crash-fix, calcul du délai, négociation, redondance UDP, rendu, Wi-Fi, planificateur. |
+| `include/netcode_internal.h` | Déclarations partagées entre les modules. |
+| `src/crash_fixes.cpp` | Correctifs de crash (pseudos Steam, pool de renvoi, lobby) et patchs d'octets vérifiés. |
+| `src/system_tuning.cpp` | Rendu DirectX 11, planificateur Windows, mode Wi-Fi gaming. |
+| `src/rtt_negotiation.cpp` | Calcul du délai, négociation hôte/client, mise en place de la synchronisation. |
+| `src/packet_redundancy.cpp` | Redondance UDP, flux spectateur, pré-chauffage du canal de combat. |
+| `src/netcode_hooks.cpp` | Attente fine des paquets, Fast NACK, gouvernance du combat, installation des hooks. |
 | `minhook/` | Bibliothèque de hooking [MinHook](https://github.com/TsudaKageyu/minhook) (sous-module Git, licence BSD-2). |
 
 ---

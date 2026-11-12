@@ -20,3 +20,7 @@ CMakeSettings.json
 
 # Runtime logs
 *.log
+
+# Local packaging output (releases are built by GitHub Actions)
+/dist/
+*.zip

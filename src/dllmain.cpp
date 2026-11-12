@@ -52,7 +52,7 @@ void WriteDefaultConfigIfMissing(const std::wstring& configPath) {
     if (!out.is_open()) return;
 
     out << "; ============================================================================\n"
-        << "; NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS - Online Crash Fix & Netcode v2.6\n"
+        << "; NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS - Online Crash Fix & Netcode v2.7\n"
         << "; Reverse-Engineered & Verified (.pdata / SteamFriends017 / ccNetFreeBattleSync / D3D11 / WLAN / MMCSS)\n"
         << "; ============================================================================\n\n"
         << "[General]\n"
@@ -78,8 +78,8 @@ void WriteDefaultConfigIfMissing(const std::wstring& configPath) {
         << "MinDelayFrames = 1\n"
         << "; MaxDelayClamp: 16 allows smooth stall-free play even on 300ms+ transcontinental matches\n"
         << "MaxDelayClamp = 16\n"
-        << "; JitterMarginMs: Phase-safe cushion (8ms + automatic RTT/12 long-haul route scaling)\n"
-        << "JitterMarginMs = 8\n\n"
+        << "; JitterMarginMs: Phase-safe cushion (5ms + automatic RTT/20 route scaling)\n"
+        << "JitterMarginMs = 5\n\n"
         << "[LowLatencyRender]\n"
         << "; Forces IDXGIDevice1::SetMaximumFrameLatency(1) + GPUThreadPriority(+5),\n"
         << "; eliminating ~33.3 ms (2 frames) of Windows default 3-frame DXGI render-queue lag.\n"
@@ -99,10 +99,10 @@ void WriteDefaultConfigIfMissing(const std::wstring& configPath) {
         << "EnableWifiGamingMode = 1\n"
         << "; Automatically adds +1/+2 frame cushion on rematches if a peer had >=3% / >=18% mid-fight stalls\n"
         << "EnableDynamicPeerAutoTune = 1\n"
-        << "; Gentle dual-edge QPC poll (850us tick 0, 450us tick 1, 45us step) across 16.67ms VSync boundaries\n"
+        << "; High-precision dual-edge QPC poll (1100us tick 0, 650us tick 1, 25us step) across 16.67ms VSync boundaries\n"
         << "EnableMicroJitterPoll = 1\n"
-        << "MicroJitterSpinUs = 850\n"
-        << "; Triggers accelerated NACK at 3 stalled frames (50ms) + single backup retry at 9 frames (150ms)\n"
+        << "MicroJitterSpinUs = 1100\n"
+        << "; Triggers accelerated NACK at 2 stalled frames (33ms) + single backup retry at 7 frames (116ms)\n"
         << "FastNackRecovery = 1\n"
         << "; Suppresses the intrusive dark 'Transmitting...' modal on brief spikes (< 180 frames / 3.0s)\n"
         << "SuppressShortOverlay = 1\n"
@@ -159,6 +159,7 @@ void LoadConfig(const std::wstring& configPath) {
         } else if (key == L"MaxDelayClamp") {
             g_Config.max_delay_clamp = std::clamp(intVal, 1, 16);
         } else if (key == L"JitterMarginMs") {
+            if (intVal == 8) intVal = 5; // Upgrade legacy v2.6 default to optimal 5ms
             g_Config.jitter_margin_ms = std::clamp(intVal, 0, 50);
         } else if (key == L"EnableLowLatencyRender") {
             g_Config.enable_low_latency_render = (intVal != 0);
@@ -179,7 +180,8 @@ void LoadConfig(const std::wstring& configPath) {
         } else if (key == L"EnableMicroJitterPoll") {
             g_Config.enable_micro_jitter_poll = (intVal != 0);
         } else if (key == L"MicroJitterSpinUs") {
-            g_Config.micro_jitter_spin_us = std::clamp(intVal, 0, 1500);
+            if (intVal == 850) intVal = 1100; // Upgrade legacy v2.6 default to 1100us
+            g_Config.micro_jitter_spin_us = std::clamp(intVal, 0, 2000);
         } else if (key == L"FastNackRecovery") {
             g_Config.fast_nack_recovery = (intVal != 0);
         } else if (key == L"SuppressShortOverlay" || key == L"DisableTaskPause") {
@@ -212,12 +214,12 @@ DWORD WINAPI MainThread(LPVOID) {
         FILE* fp = nullptr;
         freopen_s(&fp, "CONOUT$", "w", stdout);
         freopen_s(&fp, "CONOUT$", "w", stderr);
-        SetConsoleTitleA("NARUTO STORM CONNECTIONS - Netcode Overhaul Engine v2.6");
+        SetConsoleTitleA("NARUTO STORM CONNECTIONS - Netcode Overhaul Engine v2.7");
     }
 
     LogNetcode("========================================================================");
-    LogNetcode("  NARUTO X BORUTO STORM CONNECTIONS - ONLINE CRASH FIX & NETCODE v2.6  ");
-    LogNetcode("  CrashFix + Zero-Queue D3D11 + MMCSS/EcoQoS + Wi-Fi + Phase-Safe OWD  ");
+    LogNetcode("  NARUTO X BORUTO STORM CONNECTIONS - ONLINE CRASH FIX & NETCODE v2.7  ");
+    LogNetcode("  Universal Matrix (30/60FPS) + Spectator Stream + True-RTT AutoTune   ");
     LogNetcode("========================================================================");
     LogNetcode("[Config] OnlinePersonaCrashFix=%s | NetcodeOverhaul=%s | LowLatencyD3D11=%s (MaxQ=%d, SchedBoost=%s)",
                g_Config.fix_online_persona_crash ? "ON" : "OFF",
@@ -232,7 +234,7 @@ DWORD WINAPI MainThread(LPVOID) {
     LogNetcode("[Config] PacketRedundancy=%s (Depth=%d frames, MaxResendBatch=%d, VanillaSafe=ON)",
                g_Config.enable_packet_redundancy ? "ON" : "OFF",
                g_Config.redundancy_frame_depth, g_Config.max_resend_batch);
-    LogNetcode("[Config] WifiGamingMode=%s | MicroJitterPoll=%s (%d us, 45us step) | FastNACK=%s | Overlay=%d f",
+    LogNetcode("[Config] WifiGamingMode=%s | MicroJitterPoll=%s (%d us, 25us step) | FastNACK=%s | Overlay=%d f",
                g_Config.enable_wifi_gaming_mode ? "ON" : "OFF",
                g_Config.enable_micro_jitter_poll ? "ON" : "OFF",
                g_Config.micro_jitter_spin_us,

@@ -18,6 +18,10 @@ namespace StormRva {
     constexpr uintptr_t kGlobalNetFreeBattleSyncPtr = 0x21C4FF0; // VA 0x1421C4FF0 (ccNetFreeBattleSync*)
     constexpr uintptr_t kGlobalSyncCheckHandlerPtr  = 0x21C5000; // VA 0x1421C5000
     constexpr uintptr_t kGlobalTransmittingModalFlg = 0x21C5008; // VA 0x1421C5008
+    constexpr uintptr_t kGlobalGameFrameworkPtr     = 0x9709518; // VA 0x149709518 (+0x952 = active battle FPS byte: 60 or 30)
+
+    // Lobby / Session slot layout helper (ccNetLocalInfo::GetMatchSlotArray)
+    constexpr uintptr_t kLocalInfo_GetSlotArray     = 0x061DCA0; // VA 0x14061DCA0 (returns int8_t*: [0]=1P, [1]=2P, [3..8]=Spectators)
 
     // BattleBase synchronization (ccSceneNetworkBattleBase.cpp)
     // NOTE: True .pdata entry is 0x8A1F30 .. 0x8A208D (0x8A1F50 is mid-instruction!)
@@ -60,10 +64,12 @@ namespace StormRva {
     constexpr uintptr_t kFreeSync_CtrlTimeOut       = 0x10F1CB0; // VA 0x1410F1CB0 .. 0x1410F1DF7
     constexpr uintptr_t kFreeSync_BuildSendPacket   = 0x10F2310; // VA 0x1410F2310 .. 0x1410F25C2
     constexpr uintptr_t kFreeSync_SerializeOneFrame = 0x10F25D0; // VA 0x1410F25D0 .. 0x1410F2731
-    constexpr uintptr_t kFreeSync_ReceivePackets    = 0x10F2740; // VA 0x1410F2740 .. 0x1410F2D70
-    constexpr uintptr_t kFreeSync_SetupFrameSync    = 0x10F3640; // VA 0x1410F3640 .. 0x1410F381D
-    constexpr uintptr_t kFreeSync_SendBattlerPacket = 0x10F3840; // VA 0x1410F3840 .. 0x1410F3A46
-    constexpr uintptr_t kFreeSync_UpdateMemberDelay = 0x10F40D0; // VA 0x1410F40D0 .. 0x1410F41F8
+    constexpr uintptr_t kFreeSync_ReceivePackets        = 0x10F2740; // VA 0x1410F2740 .. 0x1410F2D70
+    constexpr uintptr_t kFreeSync_ReceiveWatcherPackets = 0x10F2D80; // VA 0x1410F2D80 .. 0x1410F315E
+    constexpr uintptr_t kFreeSync_SetupFrameSync        = 0x10F3640; // VA 0x1410F3640 .. 0x1410F381D
+    constexpr uintptr_t kFreeSync_SendBattlerPacket     = 0x10F3840; // VA 0x1410F3840 .. 0x1410F3A46
+    constexpr uintptr_t kFreeSync_SendSpectatorPacket   = 0x10F3A50; // VA 0x1410F3A50 .. 0x1410F3CEB
+    constexpr uintptr_t kFreeSync_UpdateMemberDelay     = 0x10F40D0; // VA 0x1410F40D0 .. 0x1410F41F8
     constexpr uintptr_t kFreeSync_ExtractFramePkt   = 0x10F4200; // VA 0x1410F4200 .. 0x1410F426F
     constexpr uintptr_t kFreeSync_StartFrameSync    = 0x10F4270; // VA 0x1410F4270 .. 0x1410F42A4
 
@@ -81,6 +87,14 @@ namespace StormRva {
     constexpr uintptr_t kPatch_RecvResendNullDeref  = 0x10F28F9; // VA 0x1410F28F9 (`48 85 C9 74 27` -> `74 2D`)
     // 3) ReceivePackets broken multi-record checksum lookahead (`[rsp+0x60]+remainBytes` instead of `recvSize-remainBytes`)
     constexpr uintptr_t kPatch_RecvLookaheadBug     = 0x10F299B; // VA 0x1410F299B (`41 83 FF 0C 76 32` -> `EB 32`)
+    // 4) CtrlWatcherInputAdvance unsigned underflow (`m_maxWatcherFrame - m_sendFrameCounter > 200` when 0 < 8 -> `jbe` to `jmp`)
+    constexpr uintptr_t kPatch_WatcherUnderflowBug  = 0x10F43CF; // VA 0x1410F43CF (`41 81 F9 C8 00 00 00 76 18` -> `EB 18`)
+    // 5) CtrlWatcherInputAdvance stall-counter clobber (`mov [rbx+0x48], eax` overwriting m_stallFrameCounter with m_waitCounter)
+    constexpr uintptr_t kPatch_WatcherStallClobber  = 0x10F463B; // VA 0x1410F463B (`8B 43 44 89 43 48` -> `8B 43 44 90 90 90`)
+    // 6) ccStateMachineCustomMatchLobby::State1_Update unslotted/spectator peer null-deref (0xC0000005 @ +0x113D7F2)
+    constexpr uintptr_t kPatch_LobbySlotNullDeref   = 0x113D7E6; // VA 0x14113D7E6 .. 0x14113D7FB (21 bytes)
+    constexpr uintptr_t kLobby_NotifyPeer           = 0x1143150; // VA 0x141143150
+    constexpr uintptr_t kLobby_State1_Next          = 0x113D7FB; // VA 0x14113D7FB
 }
 
 #pragma pack(push, 1)
@@ -236,7 +250,7 @@ struct NetcodeConfig {
     int  forced_delay_frames   = -1;   // -1 = adaptive One-Way Latency formula; >= 1 = fixed delay frames
     int  min_delay_frames      = 1;    // Protocol mathematical minimum is 1 frame (Frame 0 is reserved)
     int  max_delay_clamp       = 16;   // Allow up to 16 frames on 300ms+ transcontinental pings (causality-safe)
-    int  jitter_margin_ms      = 8;    // VSync-phase guard (ms) + automatic RTT/12 long-haul route jitter cushion
+    int  jitter_margin_ms      = 5;    // Tight VSync-phase guard (5ms) + automatic RTT/20 route jitter cushion
 
     // DirectX 11 Zero-Queue Low-Latency Render & OS Gaming Scheduler Boost
     bool enable_low_latency_render = true;
@@ -252,8 +266,8 @@ struct NetcodeConfig {
     bool enable_wifi_gaming_mode      = true; // Win32 wlanapi MediaStreaming=ON + BackgroundScan=OFF while game runs
     bool enable_dynamic_peer_autotune = true; // Auto +1/+2f rematch cushion if peer exceeds 3% / 18% mid-fight stalls
     bool enable_micro_jitter_poll     = true;
-    int  micro_jitter_spin_us         = 850;  // Gentle QPC poll (850us on tick 0, 450us on tick 1, 45us spacing)
-    bool fast_nack_recovery           = true; // Trigger accelerated NACK at 3 stalled frames (50ms) + retry at 9 (150ms)
+    int  micro_jitter_spin_us         = 1100; // High-precision QPC poll (1100us on tick 0, 650us on tick 1, 25us spacing)
+    bool fast_nack_recovery           = true; // Trigger accelerated NACK at 2 stalled frames (33ms) + retry at 7 (116ms)
     bool suppress_short_overlay       = true; // Suppress "Transmitting..." dark modal on brief spikes
     int  overlay_threshold_frames     = 180;  // Show "Transmitting..." modal only after 180 frames (3.0s) instead of 30 (0.5s)
 };
@@ -279,6 +293,7 @@ struct NetcodeTelemetry {
     std::atomic<uint64_t> totalBattleFrames{0};
     std::atomic<uint64_t> personaCallsHandled{0};
     std::atomic<uint64_t> personaPageBoundarySaves{0};
+    std::atomic<uint64_t> lobbySlotNullDerefSaves{0};
 };
 
 extern HMODULE          g_hSelfModule;

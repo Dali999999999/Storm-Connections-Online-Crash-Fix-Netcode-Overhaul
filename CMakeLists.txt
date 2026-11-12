@@ -21,6 +21,10 @@ include_directories(
 add_library(d3dcompiler_47 SHARED
     src/dllmain.cpp
     src/proxy_d3dcompiler.cpp
+    src/crash_fixes.cpp
+    src/system_tuning.cpp
+    src/rtt_negotiation.cpp
+    src/packet_redundancy.cpp
     src/netcode_hooks.cpp
     d3dcompiler_47.def
     ${MINHOOK_SOURCES}
