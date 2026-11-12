@@ -321,7 +321,20 @@ Structure du dépôt :
 
 ## 📜 Licence & avertissement
 
-Le code de ce projet est distribué sous licence **MIT** (voir [`LICENSE`](LICENSE)). MinHook reste sous sa propre licence BSD-2 (`minhook/LICENSE.txt`).
+Ce projet est distribué sous licence **[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)** (voir [`LICENSE`](LICENSE)), avec une politique d'attribution complémentaire (voir [`NOTICE.md`](NOTICE.md)). MinHook reste sous sa propre licence BSD-2 (`minhook/LICENSE.txt`).
+
+| Situation | Autorisé ? |
+| :--- | :---: |
+| Télécharger et utiliser gratuitement | ✅ |
+| Modifier le code | ✅ |
+| Publier un fork sur son propre GitHub | ✅ |
+| Donner un autre nom à son fork | ✅ |
+| Améliorer et redistribuer gratuitement | ✅ |
+| Conserver ses propres modifications | ✅ |
+| Vendre le logiciel ou un fork | ❌ |
+| Commercialiser les améliorations | ❌ |
+| Supprimer les crédits du projet original | ❌ |
+| Faire croire qu'on est l'auteur original | ❌ |
 
 Projet communautaire non officiel, **sans aucun lien avec Bandai Namco Entertainment ni CyberConnect2**. *NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS* et toutes les marques associées appartiennent à leurs propriétaires respectifs.
 

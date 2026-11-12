@@ -54,6 +54,7 @@ jobs:
           Copy-Item 'netcode_config.ini'               $pkgDir
           Copy-Item 'README.md'                        $pkgDir
           Copy-Item 'LICENSE'                          $pkgDir
+          Copy-Item 'NOTICE.md'                        $pkgDir
 
           $zip = "dist/$pkgName.zip"
           Compress-Archive -Path "$pkgDir/*" -DestinationPath $zip -Force

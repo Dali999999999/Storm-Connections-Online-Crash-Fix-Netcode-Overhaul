@@ -32,6 +32,9 @@ Toutes les évolutions notables de ce projet sont documentées ici.
 - Nouveau correctif de crash `0xC0000005` dans le lobby de partie personnalisée (`NSUNSC.exe+0x113D7F2`, spectateur ou joueur sans slot).
 - 16 hooks et 5 patchs d'octets vérifiés individuellement au démarrage.
 
+### Licence
+- Passage de la licence MIT à **PolyForm Noncommercial 1.0.0**, avec politique d'attribution complémentaire (`LICENSE`, `NOTICE.md`) : usage, modification et fork libres et gratuits ; vente et commercialisation interdites ; crédits de l'auteur original obligatoires.
+
 ### Code source
 - Refactorisation en 9 fichiers de 700 lignes maximum, sans changement de comportement.
 
