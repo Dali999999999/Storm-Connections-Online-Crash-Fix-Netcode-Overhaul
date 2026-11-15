@@ -53,6 +53,7 @@ jobs:
           Copy-Item 'build/Release/d3dcompiler_47.dll' $pkgDir
           Copy-Item 'netcode_config.ini'               $pkgDir
           Copy-Item 'README.md'                        $pkgDir
+          Copy-Item 'CHANGELOG.md'                     $pkgDir
           Copy-Item 'LICENSE'                          $pkgDir
           Copy-Item 'NOTICE.md'                        $pkgDir
 

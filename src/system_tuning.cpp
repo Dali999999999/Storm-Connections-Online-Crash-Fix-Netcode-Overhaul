@@ -23,6 +23,7 @@ struct StormPowerThrottlingState {
 };
 
 using fnSetProcessInformation_t = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+using fnNtSetTimerResolution_t  = LONG(NTAPI*)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
 using fnTimeBeginPeriod_t       = UINT(WINAPI*)(UINT);
 using fnTimeEndPeriod_t         = UINT(WINAPI*)(UINT);
 using fnAvSetMmThreadCharsW_t   = HANDLE(WINAPI*)(LPCWSTR, LPDWORD);
@@ -31,6 +32,9 @@ using fnAvRevertMmThreadChars_t = BOOL(WINAPI*)(HANDLE);
 
 HMODULE                   s_hWinMmModule       = nullptr;
 fnTimeEndPeriod_t         s_fnTimeEndPeriod    = nullptr;
+fnNtSetTimerResolution_t  s_fnNtSetTimerRes    = nullptr;
+ULONG                     s_ActualTimerRes100ns = 0;
+bool                      s_NtSubMsTimerActive = false;
 bool                      s_TimerPeriodActive  = false;
 HMODULE                   s_hAvrtModule        = nullptr;
 HANDLE                    s_hMmcssHandle       = nullptr;
@@ -133,29 +137,51 @@ void ApplyProcessGamingBoost() noexcept {
         }
     }
 
-    g_Telemetry.schedulerBoostActive.store(ecoQosDisabled || prioElevated || s_TimerPeriodActive);
-    LogNetcode("[Scheduler] Gaming Boost active: EcoQoS/TimerCoalesce=%s | Priority=%s | 1msKernelTimer=%s",
+    if (!s_NtSubMsTimerActive) {
+        if (HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll")) {
+            s_fnNtSetTimerRes = reinterpret_cast<fnNtSetTimerResolution_t>(
+                GetProcAddress(hNtdll, "NtSetTimerResolution"));
+            if (s_fnNtSetTimerRes) {
+                ULONG curRes = 0;
+                if (s_fnNtSetTimerRes(5000u, TRUE, &curRes) >= 0) { // 5000 * 100ns = 0.500 ms
+                    s_ActualTimerRes100ns = curRes;
+                    s_NtSubMsTimerActive  = true;
+                }
+            }
+        }
+    }
+
+    g_Telemetry.schedulerBoostActive.store(ecoQosDisabled || prioElevated || s_TimerPeriodActive || s_NtSubMsTimerActive);
+    LogNetcode("[Scheduler] Gaming Boost active: EcoQoS/TimerCoalesce=%s | Priority=%s | KernelTimer=%s (%0.3f ms)",
                ecoQosDisabled ? "DISABLED" : "N/A",
                prioElevated ? "ABOVE_NORMAL" : "KEPT",
-               s_TimerPeriodActive ? "LOCKED" : "DEFAULT");
+               s_NtSubMsTimerActive ? "0.5ms_NT_LOCKED" : (s_TimerPeriodActive ? "1.0ms_LOCKED" : "DEFAULT"),
+               s_NtSubMsTimerActive ? (static_cast<double>(s_ActualTimerRes100ns) / 10000.0) : (s_TimerPeriodActive ? 1.0 : 15.625));
 }
 
-void ShutdownProcessGamingBoost() noexcept {
-    if (s_hMmcssHandle && s_fnAvRevertMm) {
-        s_fnAvRevertMm(s_hMmcssHandle);
-        s_hMmcssHandle = nullptr;
-    }
-    if (s_hAvrtModule) {
-        FreeLibrary(s_hAvrtModule);
-        s_hAvrtModule = nullptr;
+void ShutdownProcessGamingBoost(bool processTerminating) noexcept {
+    if (s_NtSubMsTimerActive && s_fnNtSetTimerRes) {
+        ULONG dummyRes = 0;
+        s_fnNtSetTimerRes(5000u, FALSE, &dummyRes);
+        s_NtSubMsTimerActive = false;
     }
     if (s_TimerPeriodActive && s_fnTimeEndPeriod) {
         s_fnTimeEndPeriod(1);
         s_TimerPeriodActive = false;
     }
-    if (s_hWinMmModule) {
-        FreeLibrary(s_hWinMmModule);
-        s_hWinMmModule = nullptr;
+    if (!processTerminating) {
+        if (s_hMmcssHandle && s_fnAvRevertMm) {
+            s_fnAvRevertMm(s_hMmcssHandle);
+            s_hMmcssHandle = nullptr;
+        }
+        if (s_hAvrtModule) {
+            FreeLibrary(s_hAvrtModule);
+            s_hAvrtModule = nullptr;
+        }
+        if (s_hWinMmModule) {
+            FreeLibrary(s_hWinMmModule);
+            s_hWinMmModule = nullptr;
+        }
     }
     g_Telemetry.schedulerBoostActive.store(false);
 }
@@ -277,15 +303,17 @@ void ApplyWifiGamingLowLatencyMode(bool verboseLog) noexcept {
     s_fnWlanFreeMemory(pIfList);
 }
 
-void ShutdownWifiGamingLowLatencyMode() noexcept {
-    if (s_hWlanClientHandle && s_fnWlanCloseHandle) {
-        s_fnWlanCloseHandle(s_hWlanClientHandle, nullptr);
-        s_hWlanClientHandle = nullptr;
+void ShutdownWifiGamingLowLatencyMode(bool processTerminating) noexcept {
+    if (!processTerminating) {
+        if (s_hWlanClientHandle && s_fnWlanCloseHandle) {
+            s_fnWlanCloseHandle(s_hWlanClientHandle, nullptr);
+        }
+        if (s_hWlanApiModule) {
+            FreeLibrary(s_hWlanApiModule);
+        }
     }
-    if (s_hWlanApiModule) {
-        FreeLibrary(s_hWlanApiModule);
-        s_hWlanApiModule = nullptr;
-    }
+    s_hWlanClientHandle = nullptr;
+    s_hWlanApiModule    = nullptr;
     g_Telemetry.wifiGamingModeActive.store(false);
 }
 

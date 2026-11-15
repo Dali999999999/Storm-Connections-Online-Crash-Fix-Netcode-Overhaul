@@ -45,6 +45,31 @@ namespace StormRva {
     constexpr uintptr_t kSteam_GetFriendPersonaName   = 0x10BAD40; // VA 0x1410BAD40 .. 0x1410BADE8 (ISteamFriends::GetFriendPersonaName wrapper)
     constexpr uintptr_t kSteam_CopyFriendPersonaNameB = 0x0847A50; // VA 0x140847A50 .. 0x140847A79 (twin SSE over-read @ +0x17 = 0x0847A67)
 
+    // Input / Virtual Keyboard (fixes 0xC0000005 crash @ RVA 0x0120FFB5 & twin @ 0x0120FEE0)
+    // ccVirtualKeyboard_Win64.cpp (+0x10C7473 & +0x10C7782) passes ([rbx+0x38] + 0x60) without testing
+    // m_pKeyboard for NULL, passing 0x60 when GetKeyboardDevice(0) returns NULL.
+    constexpr uintptr_t kGlobalInputBackendPtr        = 0x9751E70; // VA 0x149751E70 (+0x08 -> +0x18 -> KeyboardBackend)
+    constexpr uintptr_t kInput_KeyboardGetPressedChar = 0x120FEB0; // VA 0x14120FEB0 .. 0x14120FF87 (faults @ +0x120FEE0)
+    constexpr uintptr_t kInput_KeyboardGetPressedKey  = 0x120FF90; // VA 0x14120FF90 .. 0x141210036 (faults @ +0x120FFB5)
+
+    // Session Abrupt-Disconnect Null-Deref, ChatTemplate UAF & Custom/Private Lobby Duplicate-Player Fixes
+    constexpr uintptr_t kCustomLobby_UpdateBattleTable = 0x00F4310; // VA 0x1400F4310 .. 0x1400F4A65 (BattleTable change queue)
+    constexpr uintptr_t kCustomLobbyUi_UpdateUserList  = 0x00FF810; // VA 0x1400FF810 .. 0x1400FFBA0 (Custom Lobby UI player rows)
+    constexpr uintptr_t kChatTemplate_ClearDynamic     = 0x0150C90; // VA 0x140150C90 .. 0x140150DD4 (faults @ +0x0150CC8 on NULL/dangling entry)
+    constexpr uintptr_t kTeamContainer_GetByIndex      = 0x094B3E0; // VA 0x14094B3E0 .. 0x14094B44C (faults @ +0x094B3ED when _Myhead=0)
+    constexpr uintptr_t kTeamContainer_FindByCharId    = 0x094B830; // VA 0x14094B830 .. 0x14094B8B7 (faults @ +0x094B837 when _Myhead=0)
+    constexpr uintptr_t kTeamContainer_FindByIndex     = 0x094B8C0; // VA 0x14094B8C0 .. 0x14094B96E (faults @ +0x094B8D8 when _Myhead=0)
+    constexpr uintptr_t kSession_GetMySlot             = 0x10B8E20; // VA 0x1410B8E20 .. 0x1410B8E36 (returns [session + 0x500])
+    constexpr uintptr_t kSessionData_AddMember         = 0x113AF60; // VA 0x14113AF60 .. 0x14113B3BF (adds SteamID to m_slots[0..7])
+    constexpr uintptr_t kSession_AssignNextUId         = 0x113B3C0; // VA 0x14113B3C0 .. 0x14113B3CE (assigns ++[session+0x168] to slot->uId)
+    constexpr uintptr_t kSession_FindSlotBySteamId     = 0x113BDC0; // VA 0x14113BDC0 .. 0x14113BE49 (finds slot* in m_slots by SteamID)
+    constexpr uintptr_t kPatch_LobbyState1SortFix      = 0x113D736; // VA 0x14113D736 .. 0x14113D797 (fixes stale rdi after qsort in State1_Update)
+    constexpr uintptr_t kSession_InvokeCallback        = 0x113D840; // VA 0x14113D840 .. 0x14113D889 (invokes OnMemberJoined callback)
+    constexpr uintptr_t kSession_SortSlots             = 0x113FA50; // VA 0x14113FA50 .. 0x14113FADB (qsort m_slots & refresh [session+0x500])
+    constexpr uintptr_t kSessionComm_SendPacket        = 0x1169290; // VA 0x141169290 .. 0x14116930C (faults @ +0x11692A3 when RCX=0)
+    constexpr uintptr_t kSessionComm_BroadcastPacket   = 0x1169310; // VA 0x141169310 .. 0x14116938F (faults @ +0x1169320 when RCX=0)
+    constexpr uintptr_t kSession_ProcessMessages       = 0x116DAE0; // VA 0x14116DAE0 .. 0x14116E02B (session packet dispatcher)
+
     // ccNetInputBuffer ring buffer methods (ccNetInputBuffer.cpp)
     constexpr uintptr_t kInputBuf_InsertFrameInput  = 0x10ED140; // VA 0x1410ED140 .. 0x1410ED1F1
     constexpr uintptr_t kInputBuf_Reset             = 0x10ED250; // VA 0x1410ED250 .. 0x1410ED280
@@ -69,6 +94,7 @@ namespace StormRva {
     constexpr uintptr_t kFreeSync_SetupFrameSync        = 0x10F3640; // VA 0x1410F3640 .. 0x1410F381D
     constexpr uintptr_t kFreeSync_SendBattlerPacket     = 0x10F3840; // VA 0x1410F3840 .. 0x1410F3A46
     constexpr uintptr_t kFreeSync_SendSpectatorPacket   = 0x10F3A50; // VA 0x1410F3A50 .. 0x1410F3CEB
+    constexpr uintptr_t kFreeSync_SendWatcherRelayPacket = 0x10F3D70; // VA 0x1410F3D70 .. 0x1410F4098
     constexpr uintptr_t kFreeSync_UpdateMemberDelay     = 0x10F40D0; // VA 0x1410F40D0 .. 0x1410F41F8
     constexpr uintptr_t kFreeSync_ExtractFramePkt   = 0x10F4200; // VA 0x1410F4200 .. 0x1410F426F
     constexpr uintptr_t kFreeSync_StartFrameSync    = 0x10F4270; // VA 0x1410F4270 .. 0x1410F42A4
@@ -95,6 +121,14 @@ namespace StormRva {
     constexpr uintptr_t kPatch_LobbySlotNullDeref   = 0x113D7E6; // VA 0x14113D7E6 .. 0x14113D7FB (21 bytes)
     constexpr uintptr_t kLobby_NotifyPeer           = 0x1143150; // VA 0x141143150
     constexpr uintptr_t kLobby_State1_Next          = 0x113D7FB; // VA 0x14113D7FB
+    // 7) nuccFree at-exit heap corruption crash (0xC0000374 in ntdll!RtlReportFatalFailure when NUCC allocator is destroyed)
+    constexpr uintptr_t kPatch_NuccFreeAtExitCrash  = 0x12732D8; // VA 0x1412732D8 (`48 85 C0 74 17` -> `74 20`)
+    // 8-10) ccStateChatWindow exit blocks (+0x16A795, +0x16A8CB, +0x16AAE1):
+    //       Unload("data/network/chatTemplateParam.bin.xfbin") executes BEFORE DestroySingleton(0x140150950),
+    //       freeing static entry buffers while m_ptrVec still points into them (UAF 0xC0000005 @ +0x0150CC8).
+    constexpr uintptr_t kPatch_ChatWindowExit1      = 0x016A795; // VA 0x14016A795 .. 0x14016A7AD (24 bytes)
+    constexpr uintptr_t kPatch_ChatWindowExit2      = 0x016A8CB; // VA 0x14016A8CB .. 0x14016A8E3 (24 bytes)
+    constexpr uintptr_t kPatch_ChatWindowExit3      = 0x016AAE1; // VA 0x14016AAE1 .. 0x14016AAF9 (24 bytes)
 }
 
 #pragma pack(push, 1)
@@ -233,8 +267,10 @@ struct NetcodeConfig {
     // Online Crash Fix: prevents 0xC0000005 Access Violation at NSUNSC.exe+0x10BAD24 (and +0x847A67)
     // caused by CyberConnect2 executing 32-byte unaligned SSE `movups` reads past the null terminator
     // of SteamFriends017::GetFriendPersonaName() pointers located near a 4KB page boundary (0x...0FE2),
-    // plus null-pointer SSE write crashes at +0x10F1455 & +0x10F2928 when the 16-slot resend pool fills.
+    // null-pointer SSE write crashes at +0x10F1455 & +0x10F2928 when the 16-slot resend pool fills,
+    // lobby slot null-deref at +0x113D7F2, plus ccVirtualKeyboard null m_pKeyboard derefs at +0x120FFB5/+0x120FEE0.
     bool fix_online_persona_crash  = true;
+    bool fix_lobby_wait_deadlock   = true;
 
     // Master switch for the Lockstep Netcode Overhaul hooks
     bool enable_netcode_overhaul   = true;
@@ -250,7 +286,7 @@ struct NetcodeConfig {
     int  forced_delay_frames   = -1;   // -1 = adaptive One-Way Latency formula; >= 1 = fixed delay frames
     int  min_delay_frames      = 1;    // Protocol mathematical minimum is 1 frame (Frame 0 is reserved)
     int  max_delay_clamp       = 16;   // Allow up to 16 frames on 300ms+ transcontinental pings (causality-safe)
-    int  jitter_margin_ms      = 5;    // Tight VSync-phase guard (5ms) + automatic RTT/20 route jitter cushion
+    int  jitter_margin_ms      = 2;    // Tight VSync-phase guard (2ms default, 0..10) + automatic RTT/24 route jitter cushion
 
     // DirectX 11 Zero-Queue Low-Latency Render & OS Gaming Scheduler Boost
     bool enable_low_latency_render = true;
@@ -294,6 +330,11 @@ struct NetcodeTelemetry {
     std::atomic<uint64_t> personaCallsHandled{0};
     std::atomic<uint64_t> personaPageBoundarySaves{0};
     std::atomic<uint64_t> lobbySlotNullDerefSaves{0};
+    std::atomic<uint64_t> virtualKeyboardNullSaves{0};
+    std::atomic<uint64_t> sessionDisconnectNullSaves{0};
+    std::atomic<uint64_t> duplicateLobbySlotSaves{0};
+    std::atomic<uint64_t> lobbyWaitDeadlockSaves{0};
+    std::atomic<uint64_t> chatTemplateCrashSaves{0};
 };
 
 extern HMODULE          g_hSelfModule;
@@ -304,4 +345,4 @@ void LogNetcode(const char* fmt, ...);
 void LoadConfig(const std::wstring& configPath);
 void WriteDefaultConfigIfMissing(const std::wstring& configPath);
 void InitializeNetcodeHooks();
-void ShutdownNetcodeHooks();
+void ShutdownNetcodeHooks(bool processTerminating = false);

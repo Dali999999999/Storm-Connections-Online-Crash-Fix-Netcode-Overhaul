@@ -2,7 +2,7 @@
 #include "netcode_mod.h"
 
 // ============================================================================
-// Internal Shared Declarations for StormNetcode v2.7 Submodules
+// Internal Shared Declarations for StormNetcode v2.8 Submodules
 // ============================================================================
 
 namespace StormInternal {
@@ -45,6 +45,8 @@ extern int32_t               s_LastLiveShieldEvalFrame;
 extern uint64_t s_MatchStartStallCount;
 extern int32_t  s_MatchPeakSyncFrame;
 extern uint64_t s_MatchStallsAtPeakFrame;
+extern bool     s_OpeningSettleCaptured;
+extern uint64_t s_OpeningSettleStalls;
 
 extern int32_t s_LastPackedSendFrame;
 extern int32_t s_SameFrameSendCount;
@@ -82,6 +84,7 @@ using fnSetupFrameSync_t           = void(__fastcall*)(ccNetFreeBattleSync* pSyn
 using fnUpdateMemberDelay_t        = void(__fastcall*)(ccNetFreeBattleSync* pSync, int32_t memberCount);
 using fnBuildSendPacket_t          = int32_t(__fastcall*)(ccNetFreeBattleSync* pSync);
 using fnSendSpectatorPacket_t      = void(__fastcall*)(ccNetFreeBattleSync* pSync);
+using fnSendWatcherRelayPacket_t   = void(__fastcall*)(ccNetFreeBattleSync* pSync, int32_t targetMemberId);
 using fnReceivePackets_t           = void(__fastcall*)(ccNetFreeBattleSync* pSync);
 using fnReceiveWatcherPackets_t    = void(__fastcall*)(ccNetFreeBattleSync* pSync);
 using fnSyncBaseInit_t             = void(__fastcall*)(void* pSyncBase);
@@ -89,12 +92,30 @@ using fnSyncBaseRecvHostWorstRtt_t = void(__fastcall*)(void* pSyncBase, void* pA
 using fnSyncBaseRecvClientRtt_t    = void(__fastcall*)(void* pSyncBase, void* pArg2, uint8_t* pPacket);
 using fnNetReliableSendPacket_t    = int32_t(__fastcall*)(void* pNetCtrl, uint8_t* pPacket, uint32_t packetSize, int32_t targetId);
 
-// SteamFriends017 Persona Name & D3D11 typedefs
+// SteamFriends017 Persona Name, Input & D3D11 typedefs
 using fnSteamContextInit_t          = void**(__fastcall*)(void* pContextInitData);
 using fnSteamGetPersonaVtbl_t       = const char*(__fastcall*)(void* pSteamFriends, uint64_t steamId);
 using fnSteamCopyFriendPersona32_t  = const char*(__fastcall*)(char* outName33, const uint64_t* pSteamId);
 using fnSteamGetFriendPersonaWrap_t = const char*(__fastcall*)(const uint64_t* pSteamId);
+using fnKeyboardGetPressedChar_t    = uint8_t(__fastcall*)(const void* pKeyMap);
+using fnKeyboardGetPressedKey_t     = uint32_t(__fastcall*)(const void* pKeyMap);
 using fnNuccD3D11Present_t          = void(__fastcall*)(void* pNuccD3D11);
+
+// Session Abrupt-Disconnect Null-Deref & Custom/Private Lobby Duplicate-Player typedefs
+using fnSessionCommSendPkt_t        = int32_t(__fastcall*)(void* pComm, void* pPacket, uint32_t packetSize, int32_t targetUId);
+using fnSessionCommBroadcastPkt_t   = int32_t(__fastcall*)(void* pComm, void* pPacket, uint32_t packetSize, int32_t excludeUId);
+using fnSessionGetMySlot_t          = void*(__fastcall*)(void* pSessionHolder);
+using fnSessionSortSlots_t          = void(__fastcall*)(void* pSession);
+using fnSessionProcessMsgs_t        = void(__fastcall*)(void* pSession);
+using fnSessionAddMember_t          = void(__fastcall*)(void* pSessionData, const uint64_t* pMemberSteamId, const uint64_t* pLobbySteamId);
+using fnSessionAssignNextUId_t      = void(__fastcall*)(void* pSession, int32_t* pSlotUId);
+using fnSessionInvokeCallback_t     = void(__fastcall*)(void* pSession, int32_t callbackId, void* pSlot);
+using fnCustomLobbyUpdateBattleTbl_t = void(__fastcall*)(void* pLobbyState);
+using fnCustomLobbyUiUpdateUsers_t  = void(__fastcall*)(void* pLobbyUi, void* pSessionData, void* pBattleTable, void* pArg4, uint64_t selectedIdx, void* pArg6);
+using fnTeamContainerGetByIndex_t   = void*(__fastcall*)(void* pContainer, uint32_t index);
+using fnTeamContainerFindByCharId_t = void*(__fastcall*)(void* pContainer, uint32_t charId);
+using fnTeamContainerFindByIndex_t  = void*(__fastcall*)(void* pContainer, uint32_t index);
+using fnChatTemplateClearDynamic_t  = void(__fastcall*)(void* pManager);
 
 extern fnCtrlBattleSync_t           oCtrlBattleSync;
 extern fnCalcNetFrameByRtt_t        oCalcNetFrameByRtt;
@@ -102,6 +123,7 @@ extern fnSetupFrameSync_t           oSetupFrameSync;
 extern fnUpdateMemberDelay_t        oUpdateMemberDelay;
 extern fnBuildSendPacket_t          oBuildSendPacket;
 extern fnSendSpectatorPacket_t      oSendSpectatorPacket;
+extern fnSendWatcherRelayPacket_t   oSendWatcherRelayPacket;
 extern fnReceivePackets_t           oReceivePackets;
 extern fnReceiveWatcherPackets_t    oReceiveWatcherPackets;
 extern fnSyncBaseInit_t             oSyncBaseInit;
@@ -112,12 +134,45 @@ extern fnNetReliableSendPacket_t    oNetReliableSendPacket;
 extern fnSteamCopyFriendPersona32_t  oSteamCopyPersonaA;
 extern fnSteamCopyFriendPersona32_t  oSteamCopyPersonaB;
 extern fnSteamGetFriendPersonaWrap_t oSteamGetPersonaWrapper;
+extern fnKeyboardGetPressedChar_t    oKeyboardGetPressedChar;
+extern fnKeyboardGetPressedKey_t     oKeyboardGetPressedKey;
 extern fnNuccD3D11Present_t          oNuccD3D11Present;
+
+extern fnSessionCommSendPkt_t        oSessionCommSendPkt;
+extern fnSessionCommBroadcastPkt_t   oSessionCommBroadcastPkt;
+extern fnSessionGetMySlot_t          oSessionGetMySlot;
+extern fnSessionSortSlots_t          oSessionSortSlots;
+extern fnSessionProcessMsgs_t        oSessionProcessMsgs;
+extern fnSessionAddMember_t          oSessionAddMember;
+extern fnSessionAssignNextUId_t      oSessionAssignNextUId;
+extern fnSessionInvokeCallback_t     oSessionInvokeCallback;
+extern fnCustomLobbyUpdateBattleTbl_t oCustomLobbyUpdateBattleTbl;
+extern fnCustomLobbyUiUpdateUsers_t  oCustomLobbyUiUpdateUsers;
+extern fnTeamContainerGetByIndex_t   oTeamContainerGetByIndex;
+extern fnTeamContainerFindByCharId_t oTeamContainerFindByCharId;
+extern fnTeamContainerFindByIndex_t  oTeamContainerFindByIndex;
+extern fnChatTemplateClearDynamic_t  oChatTemplateClearDynamic;
 
 // Module 0: Crash fixes & Byte-verified Engine Bug Patches (crash_fixes.cpp)
 const char* __fastcall hk_SteamGetFriendPersonaName(const uint64_t* pSteamId);
 const char* __fastcall hk_SteamCopyFriendPersonaNameA(char* outName33, const uint64_t* pSteamId);
 const char* __fastcall hk_SteamCopyFriendPersonaNameB(char* outName33, const uint64_t* pSteamId);
+uint8_t     __fastcall hk_KeyboardGetPressedChar(const void* pKeyMap);
+uint32_t    __fastcall hk_KeyboardGetPressedKey(const void* pKeyMap);
+int32_t     __fastcall hk_SessionCommSendPacket(void* pComm, void* pPacket, uint32_t packetSize, int32_t targetUId);
+int32_t     __fastcall hk_SessionCommBroadcastPacket(void* pComm, void* pPacket, uint32_t packetSize, int32_t excludeUId);
+void*       __fastcall hk_SessionGetMySlot(void* pSessionHolder);
+void        __fastcall hk_SessionSortSlotsAndRefreshMySlot(void* pSession);
+void        __fastcall hk_SessionProcessReceivedMessages(void* pSession);
+void        __fastcall hk_SessionAddMemberToTable(void* pSessionData, const uint64_t* pMemberSteamId, const uint64_t* pLobbySteamId);
+void        __fastcall hk_SessionAssignNextUId(void* pSession, int32_t* pSlotUId);
+void        __fastcall hk_SessionInvokeCallback(void* pSession, int32_t callbackId, void* pSlot);
+void        __fastcall hk_CustomLobbyUpdateBattleTable(void* pLobbyState);
+void        __fastcall hk_CustomLobbyUiUpdateUserList(void* pLobbyUi, void* pSessionData, void* pBattleTable, void* pArg4, uint64_t selectedIdx, void* pArg6);
+void*       __fastcall hk_TeamContainerGetByIndex(void* pContainer, uint32_t index);
+void*       __fastcall hk_TeamContainerFindByCharId(void* pContainer, uint32_t charId);
+void*       __fastcall hk_TeamContainerFindByIndex(void* pContainer, uint32_t index);
+void        __fastcall hk_ChatTemplateClearDynamic(void* pManager);
 void ApplyCrashAndNetcodeBytePatches(bool applyCrashPatches, bool applyNetcodePatches) noexcept;
 void RestoreVerifiedBytePatches() noexcept;
 bool InstallLobbySlotNullFixBridge();
@@ -125,10 +180,10 @@ void RemoveLobbySlotNullFixBridge() noexcept;
 
 // Module 0b & 0c: System, D3D11, MMCSS & WLAN Low-Latency Tuning (system_tuning.cpp)
 void ApplyProcessGamingBoost() noexcept;
-void ShutdownProcessGamingBoost() noexcept;
+void ShutdownProcessGamingBoost(bool processTerminating = false) noexcept;
 void __fastcall hk_NuccD3D11Present(void* pNuccD3D11);
 void ApplyWifiGamingLowLatencyMode(bool verboseLog) noexcept;
-void ShutdownWifiGamingLowLatencyMode() noexcept;
+void ShutdownWifiGamingLowLatencyMode(bool processTerminating = false) noexcept;
 
 // Module 1 & 2: Delay Math, RTT Negotiation & Buffer Seeding (rtt_negotiation.cpp)
 int32_t GetEngineBattleFps() noexcept;
@@ -146,13 +201,20 @@ void    __fastcall hk_SetupFrameSyncAndBuffers(ccNetFreeBattleSync* pSync);
 void    __fastcall hk_UpdateMemberCountAndDelay(ccNetFreeBattleSync* pSync, int32_t memberCount);
 
 // Module 3 & 3b: Multi-Frame UDP Redundancy & Spectator Stream (packet_redundancy.cpp)
+void    PreWarmSessionPeersOnChannel6(bool bypassThrottle = false) noexcept;
 void    PreWarmBattleUdpChannel(ccNetFreeBattleSync* pSync) noexcept;
 int32_t __fastcall hk_BuildBattlerSendPacket(ccNetFreeBattleSync* pSync);
 void    __fastcall hk_SendSpectatorPacket(ccNetFreeBattleSync* pSync);
+void    __fastcall hk_SendWatcherRelayPacket(ccNetFreeBattleSync* pSync, int32_t targetMemberId);
+void    ResetSpectatorRelayState() noexcept;
 
 // Module 4, 4b & 5: Micro-Jitter Poll, Paced FastNACK & BattleSync Governance (jitter_governance.cpp)
 void __fastcall hk_ReceivePackets(ccNetFreeBattleSync* pSync);
 void __fastcall hk_ReceiveWatcherPackets(ccNetFreeBattleSync* pSync);
 void __fastcall hk_CtrlBattleSync(void* pBattleBase);
+
+// Module 6: Endless / Custom Match Lobby WaitDialog Deadlock Fix (crash_fixes.cpp)
+void InstallLobbyWaitDeadlockHooks(int* pInstalledCount, int* pExpectedCount) noexcept;
+void ResetLobbyWaitDeadlockState() noexcept;
 
 } // namespace StormInternal

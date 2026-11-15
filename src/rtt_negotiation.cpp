@@ -180,17 +180,30 @@ void ComputeHostNegotiationState(int32_t rawRtt, int32_t& outTargetDelay, int32_
     const bool    is30Fps            = (GetEngineBattleFps() == 30);
     g_Telemetry.peerHasModHandshake.store(bothBattlersModded);
 
-    const int32_t lobbyFloor = (GetSessionMemberCount() > 2 || safeRawRtt > 8) ? 2 : 1;
+    const int32_t oneFrameMaxRtt = is30Fps ? 40 : 26;
+    const int32_t lobbyFloor     = (safeRawRtt > oneFrameMaxRtt) ? 2 : 1;
     int32_t minFloor = 3;
     if (bothBattlersModded) {
-        minFloor = std::max(lobbyFloor, std::max(g_Config.min_delay_frames, g_PeerMinDelayFloor.load()));
+        minFloor = std::max(lobbyFloor, g_Config.min_delay_frames);
     } else if (anyBattlerModded) {
-        const int32_t mixedFloor = (is30Fps || safeRawRtt <= 22) ? 2 : 3;
+        const int32_t mixedFloor = (is30Fps || safeRawRtt <= 40) ? 2 : 3;
         minFloor = std::max(mixedFloor, g_Config.min_delay_frames);
     } else {
         minFloor = std::max(is30Fps ? 2 : 3, g_Config.min_delay_frames);
     }
-    outTargetDelay  = ComputeHostAuthoritativeTargetDelay(safeRawRtt, minFloor, g_Config.max_delay_clamp, bothBattlersModded);
+    int32_t targetDelay = ComputeHostAuthoritativeTargetDelay(safeRawRtt, minFloor, g_Config.max_delay_clamp, bothBattlersModded);
+    // Merge remote peer's floor AFTER Host AutoBoost so peer boost + host boost are never double-counted
+    if (anyBattlerModded && g_Config.forced_delay_frames < 1) {
+        const int32_t peerFloor = g_PeerMinDelayFloor.load();
+        if (peerFloor > 0) {
+            const int32_t cfgMax    = std::clamp(g_Config.max_delay_clamp, minFloor, 16);
+            const int32_t upperCap  = bothBattlersModded
+                ? cfgMax
+                : std::min(cfgMax, ComputeVanillaDelayFrames(safeRawRtt, 0));
+            targetDelay = std::clamp(std::max(targetDelay, peerFloor), minFloor, std::max(targetDelay, upperCap));
+        }
+    }
+    outTargetDelay  = targetDelay;
     outSyntheticRtt = GetSyntheticRttForFrames(outTargetDelay);
 }
 
@@ -238,7 +251,41 @@ int32_t GetEngineBattleFps() noexcept {
     if (!g_BaseAddress) return 60;
     const uintptr_t pFramework = *reinterpret_cast<const uintptr_t*>(g_BaseAddress + StormRva::kGlobalGameFrameworkPtr);
     if (!pFramework) return 60;
-    return (*reinterpret_cast<const uint8_t*>(pFramework + 0x952) == 30) ? 30 : 60;
+    if (*reinterpret_cast<const uint8_t*>(pFramework + 0x952) == 30) {
+        return 30;
+    }
+
+    // In mixed 30 FPS / 60 FPS lobbies, NSUNSC.exe's ccSceneBattleModeRootBase::Initialize (+0x0876846)
+    // checks pNetManager's member FPS map (+0x183128, populated by +0x08405E0) and forces SetBattleFps(30)
+    // if ANY active member in the session has is60Fps == 0. Because Pre-Match RTT negotiation
+    // (ccSceneNetworkBattleSyncBase) runs BEFORE ccSceneBattleModeRootBase::Initialize downgrades
+    // [pFramework + 0x952] to 30, inspect [pNetManager + 0x183128] directly so RTT negotiation and
+    // SetupFrameSync always agree on 30 FPS from Phase 1.
+    const uint8_t* pNetMgr = GetGlobalNetManagerBytes();
+    if (pNetMgr) {
+        const uint8_t* pSession = *reinterpret_cast<const uint8_t* const*>(pNetMgr + 0xF8);
+        const uint8_t* pHead    = *reinterpret_cast<const uint8_t* const*>(pNetMgr + 0x183128);
+        if (pSession && pHead) {
+            const int32_t sessCount = std::clamp(*reinterpret_cast<const int32_t*>(pSession + 0x2C), 0, 16);
+            const uint8_t* node     = *reinterpret_cast<const uint8_t* const*>(pHead);
+            for (int32_t step = 0; step < 32 && node && node != pHead; ++step) {
+                const uint8_t nodeUId  = *reinterpret_cast<const uint8_t*>(node + 0x10);
+                const int32_t is60Fps  = *reinterpret_cast<const int32_t*>(node + 0x14);
+                if (is60Fps == 0 && nodeUId >= 10) {
+                    for (int32_t i = 0; i < sessCount; ++i) {
+                        const uint8_t* entry   = pSession + 0x13C + static_cast<size_t>(i) * 0x48;
+                        const uint64_t steamId = *reinterpret_cast<const uint64_t*>(entry + 0x38);
+                        const int32_t  slotUId = *reinterpret_cast<const int32_t*>(entry + 0x40);
+                        if (steamId != 0 && slotUId == static_cast<int32_t>(nodeUId)) {
+                            return 30;
+                        }
+                    }
+                }
+                node = *reinterpret_cast<const uint8_t* const*>(node);
+            }
+        }
+    }
+    return 60;
 }
 
 double GetEngineTrueFramePeriodMs() noexcept {
@@ -269,12 +316,15 @@ int32_t ComputeOptimalOneWayDelayFrames(int32_t rttMs, int32_t minFloor, int32_t
     const int32_t clampedRtt = std::max(0, rttMs);
     const int32_t owdMs      = (clampedRtt + 1) / 2;
 
-    const int32_t phaseSafeMin = (clampedRtt > 8) ? std::max(2, safeMin) : safeMin;
-    const int32_t baseMarginMs = std::clamp(g_Config.jitter_margin_ms, 2, 6);
-    // In 30 FPS mode, each simulation step is 33.33 ms (2x wider than 60 FPS), so include +14ms phase margin
+    // 1 frame is safely reachable up to ~26 ms RTT at 60 FPS (16.67 ms) or ~40 ms RTT at 30 FPS (33.33 ms)
+    const int32_t oneFrameMaxRtt = is30Fps ? 40 : 26;
+    const int32_t phaseSafeMin   = (clampedRtt > oneFrameMaxRtt) ? std::max(2, safeMin) : safeMin;
+    const int32_t baseMarginMs = std::clamp(g_Config.jitter_margin_ms, 0, 10);
+    // In 30 FPS mode, each simulation step is 33.33 ms (2x wider than 60 FPS), so include +9ms phase margin.
+    // At 60 FPS, include +3ms route-safety guard (when JitterMargin > 0) + RTT/13 jitter scaling (~48ms->2f, 108ms->5f).
     const int32_t cushionMs = is30Fps
-        ? (baseMarginMs + 14 + (clampedRtt / 12))
-        : (baseMarginMs + (clampedRtt / 20) + std::max(0, (clampedRtt - 140) / 16));
+        ? (baseMarginMs + 9 + (clampedRtt / 20))
+        : (baseMarginMs + (baseMarginMs > 0 ? 3 : 0) + (clampedRtt / 13));
     const int32_t budgetMs     = owdMs + cushionMs;
     const int32_t targetFrames = is30Fps
         ? std::max(1, (budgetMs * 3 + 99) / 100)
@@ -284,9 +334,10 @@ int32_t ComputeOptimalOneWayDelayFrames(int32_t rttMs, int32_t minFloor, int32_t
 }
 
 int32_t ComputeHostAuthoritativeTargetDelay(int32_t rttMs, int32_t minFloor, int32_t maxClamp, bool peerModded) {
-    const bool    is30Fps    = (GetEngineBattleFps() == 30);
-    const int32_t clampedRtt = std::max(0, rttMs);
-    const int32_t maxBoost   = is30Fps ? 1 : 2; // At 30 FPS, +1 frame is already +33.3ms (2x 60FPS frames)
+    const bool    is30Fps      = (GetEngineBattleFps() == 30);
+    const int32_t clampedRtt   = std::max(0, rttMs);
+    const int32_t maxBoost     = is30Fps ? 1 : 2; // At 30 FPS, +1 frame is already +33.3ms (2x 60FPS frames)
+    const int32_t baseMarginMs = std::clamp(g_Config.jitter_margin_ms, 0, 10);
 
     if (!peerModded && g_Config.forced_delay_frames < 1) {
         const int32_t vanillaDelay     = ComputeVanillaDelayFrames(clampedRtt, 0);
@@ -294,10 +345,10 @@ int32_t ComputeHostAuthoritativeTargetDelay(int32_t rttMs, int32_t minFloor, int
         const bool    anyBattlerModded = g_Battler0HasMod.load() || g_Battler1HasMod.load();
 
         if (is30Fps) {
-            // In 30 FPS (framePeriod = 33.33ms), account for the 33.3ms 30Hz sampling phase offset:
-            // At RTT=230ms (OWD=115ms), cushion30 = 26 + 23 = 49ms -> budget = 164ms -> 5f up to 180ms, 6f (200ms) at 230ms (vs Vanilla 10f = 333ms).
-            const int32_t cushion30 = anyBattlerModded ? (26 + clampedRtt / 10) : (32 + clampedRtt / 9);
-            int32_t safeDelay30     = std::clamp(((owdMs + cushion30) * 3 + 99) / 100, 2, std::max(2, vanillaDelay - 1));
+            const int32_t cushion30 = anyBattlerModded
+                ? (baseMarginMs + 13 + (clampedRtt / 16))
+                : (baseMarginMs + 22 + (clampedRtt / 12));
+            int32_t safeDelay30 = std::clamp(((owdMs + cushion30) * 3 + 99) / 100, 2, std::max(2, vanillaDelay - 1));
             if (g_Config.enable_dynamic_peer_autotune && anyBattlerModded) {
                 const int32_t boost = std::clamp(g_PeerDynamicJitterBoostFrames.load(), 0, maxBoost);
                 safeDelay30 = std::clamp(safeDelay30 + boost, 2, vanillaDelay);
@@ -305,8 +356,10 @@ int32_t ComputeHostAuthoritativeTargetDelay(int32_t rttMs, int32_t minFloor, int
             return std::clamp(safeDelay30, std::max(2, minFloor), std::max(2, maxClamp));
         }
 
-        const int32_t cushion60 = anyBattlerModded ? (15 + (clampedRtt / 14)) : (20 + (clampedRtt / 12));
-        const int32_t minSafe60 = (anyBattlerModded && clampedRtt <= 22) ? 2 : 3;
+        const int32_t cushion60 = anyBattlerModded
+            ? (baseMarginMs + 5 + (clampedRtt / 24))
+            : (baseMarginMs + 11 + (clampedRtt / 16));
+        const int32_t minSafe60 = (anyBattlerModded && clampedRtt <= 40) ? 2 : 3;
         int32_t safeDelay       = std::clamp(((owdMs + cushion60) * 3 + 49) / 50, minSafe60, std::max(minSafe60, vanillaDelay - 1));
 
         if (g_Config.enable_dynamic_peer_autotune && anyBattlerModded) {
@@ -332,8 +385,10 @@ int32_t ComputeHostAuthoritativeTargetDelay(int32_t rttMs, int32_t minFloor, int
 // ============================================================================
 
 void __fastcall hk_SyncBase_Initialize(void* pSyncBase) {
-    const int32_t  prevMatchPeakFrame  = s_MatchPeakSyncFrame;
-    const uint64_t prevMatchStallCount = s_MatchStallsAtPeakFrame;
+    const int32_t  prevMatchPeakFrame    = s_MatchPeakSyncFrame;
+    const uint64_t prevMatchStallCount   = s_MatchStallsAtPeakFrame;
+    const bool     prevOpeningCaptured   = s_OpeningSettleCaptured;
+    const uint64_t prevOpeningStallCount = s_OpeningSettleStalls;
 
     ResetPerMatchPacingState();
     oSyncBaseInit(pSyncBase);
@@ -355,10 +410,15 @@ void __fastcall hk_SyncBase_Initialize(void* pSyncBase) {
             g_PeerDynamicJitterBoostFrames.store(0);
             g_Telemetry.dynamicJitterBoostFrames.store(0);
         } else if (g_Config.enable_dynamic_peer_autotune && prevMatchPeakFrame >= 450 && myBattlerIdx >= 0) {
-            const double stallRatio = static_cast<double>(prevMatchStallCount) /
-                                      static_cast<double>(prevMatchPeakFrame);
-            const bool    is30Fps  = (GetEngineBattleFps() == 30);
-            const int32_t maxBoost = is30Fps ? 1 : 2;
+            // Measure steady-state mid-fight stalls (excluding initial frame 0..45 load skew)
+            const bool     useSteadySpan = prevOpeningCaptured && prevMatchPeakFrame > 45 && prevMatchStallCount >= prevOpeningStallCount;
+            const uint64_t evalStalls    = useSteadySpan ? (prevMatchStallCount - prevOpeningStallCount) : prevMatchStallCount;
+            const int32_t  evalFrames    = useSteadySpan ? (prevMatchPeakFrame - 45) : prevMatchPeakFrame;
+            const double   stallRatio    = static_cast<double>(evalStalls) / static_cast<double>(evalFrames);
+            const bool     is30Fps       = (GetEngineBattleFps() == 30);
+            const int32_t  maxBoost      = is30Fps ? 1 : 2;
+            const int32_t  decayMinFrms  = is30Fps ? 900 : 1800;
+
             if (stallRatio >= 0.018) {
                 const int32_t stepBoost = (!is30Fps && stallRatio >= 0.120) ? 2 : 1;
                 const int32_t prevBoost = g_PeerDynamicJitterBoostFrames.load();
@@ -368,18 +428,27 @@ void __fastcall hk_SyncBase_Initialize(void* pSyncBase) {
                     g_Telemetry.dynamicJitterBoostFrames.store(newBoost);
                     LogNetcode("[AutoTune] Rematch vs same peer had %0.2f%% mid-fight stalls (%llu/%d f) -> +%d frame cushion!",
                                stallRatio * 100.0,
-                               static_cast<unsigned long long>(prevMatchStallCount),
-                               prevMatchPeakFrame,
+                               static_cast<unsigned long long>(evalStalls),
+                               evalFrames,
                                newBoost);
                 }
-            } else if (stallRatio < 0.005 && prevMatchPeakFrame >= 3600) {
-                LogNetcode("[AutoTune] Route verified rock-solid (%0.2f%% stalls over %d f). Optimal pacing retained.",
-                           stallRatio * 100.0, prevMatchPeakFrame);
+            } else if (stallRatio < 0.005 && prevMatchPeakFrame >= decayMinFrms) {
+                const int32_t prevBoost = g_PeerDynamicJitterBoostFrames.load();
+                if (prevBoost > 0) {
+                    const int32_t newBoost = prevBoost - 1;
+                    g_PeerDynamicJitterBoostFrames.store(newBoost);
+                    g_Telemetry.dynamicJitterBoostFrames.store(newBoost);
+                    LogNetcode("[AutoTune] Route verified rock-solid (%0.2f%% stalls over %d f) -> Cushion relaxed to +%d f!",
+                               stallRatio * 100.0, evalFrames, newBoost);
+                } else if (prevMatchPeakFrame >= 3600) {
+                    LogNetcode("[AutoTune] Route verified rock-solid (%0.2f%% stalls over %d f). Optimal pacing retained.",
+                               stallRatio * 100.0, evalFrames);
+                }
             }
         }
 
         g_NegotiatedTargetDelay.store(-1);
-        g_PeerMinDelayFloor.store(2);
+        g_PeerMinDelayFloor.store(0);
         g_CapturedHostRawRttMs.store(0);
         g_ClientTrueRawRttMs.store(0);
         g_LastSentSyntheticRttMs.store(0);
@@ -413,6 +482,10 @@ void __fastcall hk_SyncBase_Initialize(void* pSyncBase) {
             }
         }
     }
+
+    // Proactively open Channel 6 P2P connections with all session peers (Host, Clients & Spectators)
+    // seconds before StartFrameSync so Client<->Client ICE traversal finishes before Frame 0.
+    PreWarmSessionPeersOnChannel6(true);
 }
 
 void __fastcall hk_SyncBase_RecvClientRTT(void* pSyncBase, void* pArg2, uint8_t* pPacket) {
@@ -446,7 +519,7 @@ void __fastcall hk_SyncBase_RecvClientRTT(void* pSyncBase, void* pArg2, uint8_t*
                 if (isSenderB1) g_Battler1HasMod.store(true);
                 if (isSenderBattler) {
                     const int32_t prevFloor = g_PeerMinDelayFloor.load();
-                    g_PeerMinDelayFloor.store((prevFloor <= 2) ? peerFloor : std::max(prevFloor, peerFloor));
+                    g_PeerMinDelayFloor.store(std::max(prevFloor, peerFloor));
                 }
                 LogNetcode("[Handshake] Remote battler (member=%d) has StormNetcode mod (min_floor=%d, clientRTT=%d ms)",
                            senderId, peerFloor, clientRtt);
@@ -506,6 +579,7 @@ int32_t __fastcall hk_NetReliableSendPacket(void* pNetCtrl, uint8_t* pPacket, ui
         const bool     isHost = IsLocalSessionHost();
 
         if (pktLen == 0x18 && chan == 4 && subCmd == 0x10) {
+            PreWarmSessionPeersOnChannel6(false);
             if (!isHost) {
                 int32_t myRawRtt = *reinterpret_cast<const int32_t*>(pPacket + 0x10);
                 const int32_t authSynth = g_AuthoritativeHostRttMs.load();
@@ -630,6 +704,7 @@ int32_t __fastcall hk_CalcNetFrameByRtt(ccNetFreeBattleSync* pSync, int32_t rttM
 
 void __fastcall hk_SetupFrameSyncAndBuffers(ccNetFreeBattleSync* pSync) {
     ResetPerMatchPacingState();
+    ResetLobbyWaitDeadlockState();
     if (!pSync) {
         oSetupFrameSync(pSync);
         return;

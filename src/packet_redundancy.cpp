@@ -253,7 +253,232 @@ bool PopNextSpectatorResendRequest(ccNetFreeBattleSync* pSync, int32_t& outFrame
     return (outFrame >= 0);
 }
 
+constexpr int32_t kMaxRelayCursors = 8;
+struct WatcherRelayCursor {
+    int32_t memberId          = -1;
+    int32_t lastSentHeadFrame = -1;
+    int32_t sameHeadCount     = 0;
+};
+
+WatcherRelayCursor g_WatcherRelayCursors[kMaxRelayCursors] = {};
+int32_t            g_LastSpectatorRelayByBattlerFrame      = -1;
+int32_t            g_SameRelayByBattlerCount               = 0;
+int32_t            g_StartupRotateIndex                    = 0;
+std::atomic<uint64_t> g_LastSessionPreWarmTickMs{ 0 };
+
+// Read-only slot lookup inside ccNetInputBuffer's 12,000-slot ring buffer without advancing ring head.
+const ccNetFrameSlot* FindConfirmed1v1SlotReadOnly(const ccNetInputBuffer* pBuf, int32_t frame) noexcept {
+    if (!pBuf || frame <= 0) {
+        return nullptr;
+    }
+    if (pBuf->m_ringHeadSlotIdx < 0 || pBuf->m_ringHeadSlotIdx >= 0x2EE0) {
+        return nullptr;
+    }
+    const int32_t delta = frame - pBuf->m_oldestFrameInRing;
+    if (delta < 0 || delta >= 0x2EE0) {
+        return nullptr;
+    }
+    const int32_t slotIdx = (pBuf->m_ringHeadSlotIdx + delta) % 0x2EE0;
+    const ccNetFrameSlot* slot = &pBuf->m_slots[slotIdx];
+    if (slot->frameNumber != frame ||
+        slot->players[0].bReceived == 0 ||
+        slot->players[1].bReceived == 0) {
+        return nullptr;
+    }
+    return slot;
+}
+
+// Encodes an exact native 0x38 (56)-byte Head-Spectator relay record (hdr0 = frame | 0x08000000).
+// ReceiveWatcherPackets (0x1410F2EE6..0x1410F3138) sets desyncHash = 0 for BOTH players on relay
+// records, ensuring player0.desyncHash == player1.desyncHash == 0 (zero risk of OnDesync()).
+uint8_t* AppendRelayRecord(uint8_t* dst, int32_t frame, int32_t senderMemberId, const ccNetFrameSlot* slot) noexcept {
+    static_assert(offsetof(ccNetFrameSlot, players) + offsetof(ccNetSlotPlayerEntry, buttons) == 0x08, "P0 offset mismatch");
+    static_assert(offsetof(ccNetFrameSlot, players) + sizeof(ccNetSlotPlayerEntry) + offsetof(ccNetSlotPlayerEntry, buttons) == 0x28, "P1 offset mismatch");
+
+    const uint32_t hdr0 = static_cast<uint32_t>(frame) | 0x08000000u;
+    const uint32_t hdr1 = 0u;
+    const uint32_t hdr2 = hdr0 + hdr1;
+    std::memcpy(dst + 0x00, &hdr0, 4);
+    std::memcpy(dst + 0x04, &hdr1, 4);
+    std::memcpy(dst + 0x08, &hdr2, 4);
+    std::memcpy(dst + 0x0C, &senderMemberId, 4);
+    std::memcpy(dst + 0x10, &slot->players[0].buttons, 20);
+    std::memcpy(dst + 0x24, &slot->players[1].buttons, 20);
+    return dst + 0x38;
+}
+
+int32_t ResolveLocalMemberId(const ccNetFreeBattleSync* pSync, int32_t battlerCount) noexcept {
+    if (!pSync) return -1;
+    const int32_t mySlot = (pSync->m_myPlayerIdx >= 0 && pSync->m_myPlayerIdx < 4)
+        ? pSync->m_myPlayerIdx
+        : (battlerCount + pSync->m_myWatcherIdx);
+    if (mySlot < 0 || mySlot >= 8) {
+        return -1;
+    }
+    return static_cast<int32_t>(pSync->m_memberIds[mySlot]);
+}
+
+uint64_t FindSessionSteamIdForMember(const uint8_t* pSession, uint32_t sessionMemberCount, int32_t memberId) noexcept {
+    if (!pSession || memberId < 0) return 0;
+    const uint32_t capped = std::min<uint32_t>(sessionMemberCount, 16u);
+    for (uint32_t i = 0; i < capped; ++i) {
+        const uint8_t* entry = pSession + 0x13C + static_cast<size_t>(i) * 0x48;
+        if (*reinterpret_cast<const int32_t*>(entry + 0x40) == memberId) {
+            return *reinterpret_cast<const uint64_t*>(entry + 0x38);
+        }
+    }
+    return 0;
+}
+
+// Allows a modded Battler to directly stream confirmed 1v1 relay records (desyncHash=0) to secondary
+// spectators (w >= 1) on Channel 6 so an unmodded 30 FPS Head Spectator never throttles them to 30 FPS.
+void RelayConfirmedFramesToSecondarySpectators(ccNetFreeBattleSync* pSync,
+                                                 const uint8_t* pSession,
+                                                 uint32_t sessionMemberCount,
+                                                 int32_t battlerCount,
+                                                 int32_t myMemberId) noexcept {
+    if (!pSync || !pSync->m_pInputBuffer || !pSession || !g_fnUdpSocketSend) return;
+    if (pSync->m_battlerCount != 2 || sessionMemberCount <= static_cast<uint32_t>(battlerCount)) return;
+    if (*reinterpret_cast<void* const*>(pSync->m_udpSocket + 0x18) == nullptr) return;
+
+    const ccNetInputBuffer* pBuf = pSync->m_pInputBuffer;
+    const int32_t confirmedFrame = pBuf->m_confirmedAllPlayersFrame;
+    if (confirmedFrame < 1) {
+        return;
+    }
+
+    const bool advanced = (confirmedFrame > g_LastSpectatorRelayByBattlerFrame);
+    if (advanced) {
+        g_SameRelayByBattlerCount = 1;
+    } else {
+        ++g_SameRelayByBattlerCount;
+        // Gentle backup resend on tick 3 and every 10th tick up to 40, then wait for new confirmation
+        if (g_SameRelayByBattlerCount != 3 &&
+            (g_SameRelayByBattlerCount > 40 || (g_SameRelayByBattlerCount % 10) != 0)) {
+            return;
+        }
+    }
+
+    int32_t firstNeeded = (g_LastSpectatorRelayByBattlerFrame >= 1 && advanced)
+        ? (g_LastSpectatorRelayByBattlerFrame + 1)
+        : (confirmedFrame - 3);
+    int32_t startFrame = std::min(firstNeeded, confirmedFrame - 3);
+    if ((confirmedFrame - startFrame + 1) > 6) {
+        startFrame = confirmedFrame - 5;
+    }
+    startFrame = std::max(1, startFrame);
+
+    uint8_t  relayBuf[6 * 0x38 + 16] = {};
+    uint8_t* writePtr                = relayBuf;
+    int32_t  highestPacked           = -1;
+
+    for (int32_t f = startFrame; f <= confirmedFrame; ++f) {
+        const ccNetFrameSlot* slot = FindConfirmed1v1SlotReadOnly(pBuf, f);
+        if (!slot) {
+            continue;
+        }
+        writePtr      = AppendRelayRecord(writePtr, f, myMemberId, slot);
+        highestPacked = f;
+    }
+
+    const uint32_t totalBytes = static_cast<uint32_t>(writePtr - relayBuf);
+    if (totalBytes == 0) {
+        return;
+    }
+
+    if (highestPacked > g_LastSpectatorRelayByBattlerFrame) {
+        g_LastSpectatorRelayByBattlerFrame = highestPacked;
+    }
+
+    bool firstWatcherSeen = false;
+    for (int32_t w = 0; w < (8 - battlerCount); ++w) {
+        const int32_t candidateId = static_cast<int32_t>(pSync->m_memberIds[battlerCount + w]);
+        if (candidateId < 0 || candidateId == myMemberId) {
+            continue;
+        }
+        const uint64_t steamId = FindSessionSteamIdForMember(pSession, sessionMemberCount, candidateId);
+        if (steamId == 0) {
+            continue;
+        }
+        if (!firstWatcherSeen) {
+            // Skip w == 0 (Head Spectator receives full per-player packets with desyncHash)
+            firstWatcherSeen = true;
+            continue;
+        }
+        ccNetUdpEndpoint ep{ steamId, 6u };
+        g_fnUdpSocketSend(pSync->m_udpSocket, &ep, relayBuf, totalBytes);
+    }
+}
+
 } // namespace
+
+void ResetSpectatorRelayState() noexcept {
+    for (auto& c : g_WatcherRelayCursors) {
+        c = WatcherRelayCursor{};
+    }
+    g_LastSpectatorRelayByBattlerFrame = -1;
+    g_SameRelayByBattlerCount          = 0;
+    g_StartupRotateIndex               = 0;
+    g_LastSessionPreWarmTickMs.store(0, std::memory_order_relaxed);
+}
+
+// Opens Steam P2P Channel 6 connections with ALL lobby/session peers ahead of StartFrameSync
+// (especially critical when Host is Spectating and Client 1 <-> Client 2 must complete ICE/SDR
+// traversal for the first time). Uses a stack-local dummy ccNetUDPSocket and Frame 0 No-Op `{0,1,1}`.
+void PreWarmSessionPeersOnChannel6(bool bypassThrottle) noexcept {
+    if (!g_BaseAddress || !g_fnUdpSocketSend) {
+        return;
+    }
+
+    const uint64_t nowMs  = GetTickCount64();
+    const uint64_t prevMs = g_LastSessionPreWarmTickMs.load(std::memory_order_relaxed);
+    if (!bypassThrottle && prevMs != 0 && (nowMs - prevMs) < 250ULL) {
+        return;
+    }
+
+    const uint8_t* pNetMgr = *reinterpret_cast<const uint8_t* const*>(g_BaseAddress + StormRva::kGlobalNetManagerPtr);
+    if (!pNetMgr) {
+        return;
+    }
+    const uint8_t* pSession = *reinterpret_cast<const uint8_t* const*>(pNetMgr + 0xF8);
+    if (!pSession) {
+        return;
+    }
+
+    int32_t localMemberId = -1;
+    if (const uint8_t* pLocalInfo = *reinterpret_cast<const uint8_t* const*>(pNetMgr + 0x100)) {
+        localMemberId = *reinterpret_cast<const int32_t*>(pLocalInfo + 0x24);
+    }
+
+    const int32_t sessCount = std::clamp(*reinterpret_cast<const int32_t*>(pSession + 0x2C), 0, 16);
+    if (sessCount <= 1) {
+        return;
+    }
+
+    alignas(4) static constexpr uint32_t kWarmupNoOp12[3] = { 0x00000000u, 0x00000001u, 0x00000001u };
+    const auto* rawNoOp = reinterpret_cast<const uint8_t*>(kWarmupNoOp12);
+
+    uint8_t dummySock[0x20]    = {};
+    uint8_t dummyScratch[32]   = {};
+    *reinterpret_cast<void**>(dummySock + 0x18) = dummyScratch;
+
+    bool sentAny = false;
+    for (int32_t i = 0; i < sessCount; ++i) {
+        const uint8_t* entry    = pSession + 0x13C + static_cast<size_t>(i) * 0x48;
+        const int32_t  memberId = *reinterpret_cast<const int32_t*>(entry + 0x40);
+        const uint64_t steamId  = *reinterpret_cast<const uint64_t*>(entry + 0x38);
+        if (steamId == 0 || memberId == localMemberId) {
+            continue;
+        }
+        ccNetUdpEndpoint ep{ steamId, 6u };
+        g_fnUdpSocketSend(dummySock, &ep, rawNoOp, 12u);
+        sentAny = true;
+    }
+
+    if (sentAny) {
+        g_LastSessionPreWarmTickMs.store(nowMs, std::memory_order_relaxed);
+    }
+}
 
 // Pre-warms Steam P2P Channel 6 during SetupFrameSyncAndBuffers / UpdateMemberCountAndDelay
 // (seconds before Frame 0 of the fight begins) using the native 12-byte Frame 0 No-Op
@@ -272,26 +497,21 @@ void PreWarmBattleUdpChannel(ccNetFreeBattleSync* pSync) noexcept {
 
     SendAuxiliaryDatagramToBattlers(pSync, rawNoOp, 12u);
 
-    // If we are an active Battler and the lobby has Spectators, also warm up Channel 6 to the Head Spectator
-    if (pSync->m_myPlayerIdx >= 0 && pSync->m_myPlayerIdx < 4) {
-        const int32_t  battlerCount = std::clamp(pSync->m_battlerCount, 0, 8);
-        const auto*    pSession     = reinterpret_cast<const uint8_t*>(pSync->m_pNetSession);
-        const uint32_t sessCount    = *reinterpret_cast<const uint32_t*>(pSession + 0x2C);
-        if (sessCount > static_cast<uint32_t>(battlerCount)) {
-            for (int32_t w = 0; w < (8 - battlerCount); ++w) {
-                const int32_t candidateId = static_cast<int32_t>(pSync->m_memberIds[battlerCount + w]);
-                if (candidateId < 0) continue;
-                for (uint32_t i = 0; i < sessCount && i < 16; ++i) {
-                    const uint8_t* entry = pSession + 0x13C + static_cast<size_t>(i) * 0x48;
-                    if (*reinterpret_cast<const int32_t*>(entry + 0x40) == candidateId) {
-                        const uint64_t watcherSteamId = *reinterpret_cast<const uint64_t*>(entry + 0x38);
-                        if (watcherSteamId != 0) {
-                            ccNetUdpEndpoint ep{ watcherSteamId, 6u };
-                            g_fnUdpSocketSend(pSync->m_udpSocket, &ep, rawNoOp, 12u);
-                        }
-                        return;
-                    }
-                }
+    // Also pre-warm Channel 6 toward ALL Spectators (so secondary spectators also open P2P early)
+    const int32_t  battlerCount = std::clamp(pSync->m_battlerCount, 0, 8);
+    const int32_t  myMemberId   = ResolveLocalMemberId(pSync, battlerCount);
+    const auto*    pSession     = reinterpret_cast<const uint8_t*>(pSync->m_pNetSession);
+    const uint32_t sessCount    = *reinterpret_cast<const uint32_t*>(pSession + 0x2C);
+    if (sessCount > static_cast<uint32_t>(battlerCount)) {
+        for (int32_t w = 0; w < (8 - battlerCount); ++w) {
+            const int32_t candidateId = static_cast<int32_t>(pSync->m_memberIds[battlerCount + w]);
+            if (candidateId < 0 || candidateId == myMemberId) {
+                continue;
+            }
+            const uint64_t watcherSteamId = FindSessionSteamIdForMember(pSession, sessCount, candidateId);
+            if (watcherSteamId != 0) {
+                ccNetUdpEndpoint ep{ watcherSteamId, 6u };
+                g_fnUdpSocketSend(pSync->m_udpSocket, &ep, rawNoOp, 12u);
             }
         }
     }
@@ -387,17 +607,59 @@ int32_t __fastcall hk_BuildBattlerSendPacket(ccNetFreeBattleSync* pSync) {
     }
 
     // 5. CRITICAL ANTI-FLOOD GUARD FOR STALLED TICKS (s_SameFrameSendCount > 1):
-    //    In vanilla NSUNSC.exe (0x1410F234D..0x1410F24D6), when the game is stalled waiting for the
-    //    remote peer's input (s_SameFrameSendCount >= 2), currentFrame was ALREADY sampled and sent
-    //    on tick 1. Flooding duplicate packets on every stalled tick congests Wi-Fi / Steam P2P!
-    //    While stalled, ONLY send a packet if:
-    //      a) We have outbound NACK headers in m_pRawUdpSendBuf (clampedPrefixBytes > 0), OR
-    //      b) On tick 4 of a stall (1 single backup re-transmission of currentFrame in case tick 1 dropped).
+    //    Normally, while stalled waiting for a remote input mid-fight, silence keeps Wi-Fi un-congested.
+    //    EXCEPTION: During initial opening lockstep (confirmed < m_netDelayFrames), Client<->Client Steam P2P
+    //    may still be finishing NAT/ICE handshake, so keep Channel 6 alive gently and rotate unconfirmed
+    //    opening frames [m_netDelayFrames .. currentFrame - 1] so no opening frames remain lost!
     if (s_SameFrameSendCount > 1) {
-        if (clampedPrefixBytes == 0 && s_SameFrameSendCount != 4) {
+        const int32_t confFrame        = pSync->m_pInputBuffer->m_confirmedAllPlayersFrame;
+        const int32_t delayFloor       = std::max<int32_t>(1, pSync->m_netDelayFrames);
+        const bool    inStartupLockstep = (confFrame < delayFloor);
+
+        const bool startupKeepaliveTick = inStartupLockstep &&
+            (s_SameFrameSendCount == 2 ||
+             s_SameFrameSendCount == 4 ||
+             (s_SameFrameSendCount >= 6 && (s_SameFrameSendCount % 6) == 0));
+
+        if (clampedPrefixBytes == 0 && s_SameFrameSendCount != 4 && !startupKeepaliveTick) {
             pSync->m_rawUdpSendSize = 0;
             return auxFramesDelivered;
         }
+
+        if (inStartupLockstep && (clampedPrefixBytes > 0 || startupKeepaliveTick)) {
+            const int32_t firstMissing = std::max(delayFloor, confFrame + 1);
+            const int32_t spanCount    = currentFrame - firstMissing;
+            if (spanCount > 0) {
+                const int32_t maxRotate = std::min<int32_t>(2, spanCount);
+                for (int32_t k = 0; k < maxRotate; ++k) {
+                    const int32_t candFrame = firstMissing + ((g_StartupRotateIndex + k) % spanCount);
+                    if (candFrame >= delayFloor && candFrame < currentFrame) {
+                        bool alreadySent = false;
+                        for (int32_t r = 0; r < resendCount; ++r) {
+                            if (resendFrames[r] == candFrame) {
+                                alreadySent = true;
+                                break;
+                            }
+                        }
+                        if (!alreadySent && IsLocalFrameReadyForSend(pSync, candFrame)) {
+                            uint8_t singleBuf[32] = {};
+                            alignas(16) ccNetFrameInputPacket pkt = {};
+                            g_fnFreeSyncExtractFramePkt(pSync, &pkt, candFrame);
+                            if (pkt.frameNumber != 0 && pkt.checksum != 0) {
+                                uint8_t* endPtr = g_fnFreeSyncSerializeOneFrm(singleBuf, &pkt);
+                                const uint32_t singleLen = static_cast<uint32_t>(endPtr - singleBuf);
+                                if (singleLen >= 12) {
+                                    SendAuxiliaryDatagramToBattlers(pSync, singleBuf, singleLen);
+                                    ++auxFramesDelivered;
+                                }
+                            }
+                        }
+                    }
+                }
+                g_StartupRotateIndex = (g_StartupRotateIndex + maxRotate) % spanCount;
+            }
+        }
+
         // Pack only currentFrame (1 record at end of packet -> remain == 0 <= 12, 100% vanilla-safe)
         if (IsLocalFrameReadyForSend(pSync, currentFrame)) {
             alignas(16) ccNetFrameInputPacket curPkt = {};
@@ -578,6 +840,10 @@ void __fastcall hk_SendSpectatorPacket(ccNetFreeBattleSync* pSync) {
         return;
     }
 
+    // Stream confirmed 1v1 relay frames (desyncHash=0) directly to non-head Spectators (w >= 1)
+    // before any stalled early return so an unmodded 30 FPS Head Spectator never throttles them.
+    RelayConfirmedFramesToSecondarySpectators(pSync, pSession, sessionMemberCount, battlerCount, myMemberId);
+
     // 2. Build ascending sliding window [currentFrame - effectiveDepth + 1 .. currentFrame]
     const int32_t currentFrame = pSync->m_sendFrameCounter;
     if (currentFrame != s_LastPackedSpectatorSendFrame) {
@@ -689,6 +955,120 @@ void __fastcall hk_SendSpectatorPacket(ccNetFreeBattleSync* pSync) {
         ep.steamId = headWatcherSteamId;
         ep.channel = 6u; // Battle FrameSync P2P channel
         g_fnUdpSocketSend(&pSync->m_udpSocket, &ep, rawBase, totalBytes);
+    }
+}
+
+// ============================================================================
+// 3c. Unthrottled Head-Spectator Relay
+//     Hook on ccNetFreeBattleSync::SendWatcherRelayPacket (VA 0x1410F3D70)
+//     In vanilla NSUNSC.exe, Head Spectator uses m_currentSyncFrame (locked to its
+//     own render rate, e.g. 30 FPS) instead of m_confirmedAllPlayersFrame, which caps
+//     secondary 60 FPS Spectators to 30 FPS slow-motion. We relay confirmed 1v1 frames
+//     up to m_confirmedAllPlayersFrame with catch-up bursts (up to 6 frames / tick).
+// ============================================================================
+
+void __fastcall hk_SendWatcherRelayPacket(ccNetFreeBattleSync* pSync, int32_t targetMemberId) {
+    if (!pSync ||
+        !pSync->m_pInputBuffer ||
+        !pSync->m_pNetSession ||
+        !pSync->m_pRawUdpSendBuf ||
+        !g_fnUdpSocketSend ||
+        pSync->m_battlerCount != 2 ||
+        targetMemberId < 0) {
+        oSendWatcherRelayPacket(pSync, targetMemberId);
+        return;
+    }
+
+    const auto*    pSession  = reinterpret_cast<const uint8_t*>(pSync->m_pNetSession);
+    const uint32_t sessCount = *reinterpret_cast<const uint32_t*>(pSession + 0x2C);
+    const uint64_t targetSteamId = FindSessionSteamIdForMember(pSession, sessCount, targetMemberId);
+    if (targetSteamId == 0) {
+        oSendWatcherRelayPacket(pSync, targetMemberId);
+        return;
+    }
+
+    const int32_t battlerCount   = std::clamp(pSync->m_battlerCount, 0, 8);
+    const int32_t senderMemberId = ResolveLocalMemberId(pSync, battlerCount);
+    if (senderMemberId < 0) {
+        oSendWatcherRelayPacket(pSync, targetMemberId);
+        return;
+    }
+
+    const ccNetInputBuffer* pBuf = pSync->m_pInputBuffer;
+    const int32_t headFrame      = std::max(pBuf->m_confirmedAllPlayersFrame, pBuf->m_currentSyncFrame);
+    if (headFrame <= 0) {
+        pSync->m_rawUdpSendSize = 0;
+        return;
+    }
+
+    // Locate or allocate per-target cursor (up to 8 spectators)
+    WatcherRelayCursor* cursor = nullptr;
+    for (auto& c : g_WatcherRelayCursors) {
+        if (c.memberId == targetMemberId) {
+            cursor = &c;
+            break;
+        }
+    }
+    if (!cursor) {
+        for (auto& c : g_WatcherRelayCursors) {
+            if (c.memberId < 0) {
+                c.memberId          = targetMemberId;
+                c.lastSentHeadFrame = headFrame - 1;
+                c.sameHeadCount     = 0;
+                cursor              = &c;
+                break;
+            }
+        }
+    }
+
+    const bool advanced = cursor ? (headFrame > cursor->lastSentHeadFrame) : true;
+    if (cursor) {
+        if (advanced) {
+            cursor->sameHeadCount = 1;
+        } else {
+            ++cursor->sameHeadCount;
+            // While Head Spectator has not confirmed a newer frame, keep duplicate traffic low
+            const bool allowRepeat = (cursor->sameHeadCount == 2) ||
+                                     (cursor->sameHeadCount == 4) ||
+                                     (cursor->sameHeadCount >= 6 && cursor->sameHeadCount <= 180 && (cursor->sameHeadCount % 6) == 0) ||
+                                     (cursor->sameHeadCount > 180 && (cursor->sameHeadCount % 30) == 0);
+            if (!allowRepeat) {
+                pSync->m_rawUdpSendSize = 0;
+                return;
+            }
+        }
+    }
+
+    const int32_t firstNeeded = (cursor && advanced) ? (cursor->lastSentHeadFrame + 1) : (headFrame - 3);
+    int32_t startFrame = std::min(firstNeeded, headFrame - 3);
+    if ((headFrame - startFrame + 1) > 6) {
+        startFrame = headFrame - 5;
+    }
+    startFrame = std::max(1, startFrame);
+
+    uint8_t* const rawBase  = pSync->m_pRawUdpSendBuf;
+    uint8_t*       writePtr = rawBase;
+    int32_t        highestPacked = -1;
+
+    for (int32_t f = startFrame; f <= headFrame; ++f) {
+        const ccNetFrameSlot* slot = FindConfirmed1v1SlotReadOnly(pBuf, f);
+        if (!slot) {
+            continue;
+        }
+        writePtr      = AppendRelayRecord(writePtr, f, senderMemberId, slot);
+        highestPacked = f;
+    }
+
+    const uint32_t totalBytes = static_cast<uint32_t>(writePtr - rawBase);
+    pSync->m_rawUdpSendSize   = totalBytes;
+    pSync->m_lastPeerMemberId = targetMemberId;
+
+    if (totalBytes > 0) {
+        if (cursor && highestPacked > cursor->lastSentHeadFrame) {
+            cursor->lastSentHeadFrame = highestPacked;
+        }
+        ccNetUdpEndpoint ep{ targetSteamId, 6u };
+        g_fnUdpSocketSend(pSync->m_udpSocket, &ep, rawBase, totalBytes);
     }
 }
 

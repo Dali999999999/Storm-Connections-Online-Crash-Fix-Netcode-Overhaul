@@ -5,7 +5,7 @@
 #include <intrin.h>
 
 // ============================================================================
-// StormNetcode v2.7 Core Coordinator:
+// StormNetcode v2.8 Core Coordinator:
 //   - Shared State & Function Pointer Definitions (`namespace StormInternal`)
 //   - Module 4:  Battler Micro-Jitter Poll & Paced Dual-Shot FastNACK (`hk_ReceivePackets`)
 //   - Module 4b: Spectator Micro-Jitter Poll, Initial-Load Guard & Paced NACK (`hk_ReceiveWatcherPackets`)
@@ -23,7 +23,7 @@ LARGE_INTEGER g_QpcFreq     = {};
 
 // Per-match negotiation & per-frame lockstep pacing state
 std::atomic<int32_t>  g_NegotiatedTargetDelay{-1};
-std::atomic<int32_t>  g_PeerMinDelayFloor{2};
+std::atomic<int32_t>  g_PeerMinDelayFloor{0};
 std::atomic<int32_t>  g_CapturedHostRawRttMs{0};
 std::atomic<int32_t>  g_ClientTrueRawRttMs{0};
 std::atomic<int32_t>  g_LastSentSyntheticRttMs{0};
@@ -46,6 +46,8 @@ int32_t               s_LastLiveShieldEvalFrame = 0;
 uint64_t s_MatchStartStallCount   = 0;
 int32_t  s_MatchPeakSyncFrame     = 0;
 uint64_t s_MatchStallsAtPeakFrame = 0;
+bool     s_OpeningSettleCaptured  = false;
+uint64_t s_OpeningSettleStalls    = 0;
 
 int32_t s_LastPackedSendFrame          = -1;
 int32_t s_SameFrameSendCount           = 0;
@@ -63,9 +65,12 @@ void ResetPerMatchPacingState() noexcept {
     s_LastStallConfirmedFrame       = -2;
     s_StalledTicksOnConfFrame       = 0;
     s_InitialSpectatorWaitTicks     = 0;
+    ResetSpectatorRelayState();
     s_MatchStartStallCount          = g_Telemetry.lockstepStallFrames.load(std::memory_order_relaxed);
     s_MatchPeakSyncFrame            = 0;
     s_MatchStallsAtPeakFrame        = 0;
+    s_OpeningSettleCaptured         = false;
+    s_OpeningSettleStalls           = 0;
     g_LiveAntiJitterActive.store(false);
     g_LiveAntiJitterRedundancyDepth.store(std::clamp(g_Config.redundancy_frame_depth, 1, 6));
     g_LiveAntiJitterSpinUs.store(std::clamp(g_Config.micro_jitter_spin_us, 50, 2000));
@@ -90,6 +95,7 @@ fnSetupFrameSync_t           oSetupFrameSync           = nullptr;
 fnUpdateMemberDelay_t        oUpdateMemberDelay        = nullptr;
 fnBuildSendPacket_t          oBuildSendPacket          = nullptr;
 fnSendSpectatorPacket_t      oSendSpectatorPacket      = nullptr;
+fnSendWatcherRelayPacket_t   oSendWatcherRelayPacket   = nullptr;
 fnReceivePackets_t           oReceivePackets           = nullptr;
 fnReceiveWatcherPackets_t    oReceiveWatcherPackets    = nullptr;
 fnSyncBaseInit_t             oSyncBaseInit             = nullptr;
@@ -97,10 +103,27 @@ fnSyncBaseRecvHostWorstRtt_t oSyncBaseRecvHostWorstRtt = nullptr;
 fnSyncBaseRecvClientRtt_t    oSyncBaseRecvClientRtt    = nullptr;
 fnNetReliableSendPacket_t    oNetReliableSendPacket    = nullptr;
 
-fnSteamCopyFriendPersona32_t  oSteamCopyPersonaA      = nullptr;
-fnSteamCopyFriendPersona32_t  oSteamCopyPersonaB      = nullptr;
-fnSteamGetFriendPersonaWrap_t oSteamGetPersonaWrapper = nullptr;
-fnNuccD3D11Present_t          oNuccD3D11Present       = nullptr;
+fnSteamCopyFriendPersona32_t   oSteamCopyPersonaA          = nullptr;
+fnSteamCopyFriendPersona32_t   oSteamCopyPersonaB          = nullptr;
+fnSteamGetFriendPersonaWrap_t  oSteamGetPersonaWrapper     = nullptr;
+fnKeyboardGetPressedChar_t     oKeyboardGetPressedChar     = nullptr;
+fnKeyboardGetPressedKey_t      oKeyboardGetPressedKey      = nullptr;
+fnNuccD3D11Present_t           oNuccD3D11Present           = nullptr;
+
+fnSessionCommSendPkt_t         oSessionCommSendPkt         = nullptr;
+fnSessionCommBroadcastPkt_t    oSessionCommBroadcastPkt    = nullptr;
+fnSessionGetMySlot_t           oSessionGetMySlot           = nullptr;
+fnSessionSortSlots_t           oSessionSortSlots           = nullptr;
+fnSessionProcessMsgs_t         oSessionProcessMsgs         = nullptr;
+fnSessionAddMember_t           oSessionAddMember           = nullptr;
+fnSessionAssignNextUId_t       oSessionAssignNextUId       = nullptr;
+fnSessionInvokeCallback_t      oSessionInvokeCallback      = nullptr;
+fnCustomLobbyUpdateBattleTbl_t oCustomLobbyUpdateBattleTbl = nullptr;
+fnCustomLobbyUiUpdateUsers_t   oCustomLobbyUiUpdateUsers   = nullptr;
+fnTeamContainerGetByIndex_t    oTeamContainerGetByIndex    = nullptr;
+fnTeamContainerFindByCharId_t  oTeamContainerFindByCharId  = nullptr;
+fnTeamContainerFindByIndex_t   oTeamContainerFindByIndex   = nullptr;
+fnChatTemplateClearDynamic_t   oChatTemplateClearDynamic   = nullptr;
 
 // ============================================================================
 // 4. Gentle Micro-Jitter Poll & Paced Single-Shot FastNACK Recovery
@@ -196,9 +219,12 @@ void __fastcall hk_ReceivePackets(ccNetFreeBattleSync* pSync) {
         const int32_t frameMs   = is30Fps ? 33 : 16;
         const int32_t rawRtt    = std::max(0, g_Telemetry.lastRawRttMs.load());
         const int32_t rttTicks  = std::clamp((rawRtt + frameMs - 1) / frameMs, 2, 24);
-        const int32_t nackTick1 = is30Fps ? 2 : (g_LiveAntiJitterActive.load() ? 3 : 2);
+        const int32_t nackTick1 = 2;
         const int32_t nackTick2 = nackTick1 + std::max(5, rttTicks + 2);
-        const int32_t retryStep = std::max(6, rttTicks + 3);
+        const int32_t rawStep   = std::max(6, rttTicks + 3);
+        const int32_t retryStep = (conf < std::max<int32_t>(1, pSync->m_netDelayFrames))
+            ? std::clamp(rttTicks, 4, 10)
+            : rawStep;
 
         const bool shouldFireNack =
             (s_StalledTicksOnConfFrame == nackTick1) ||
@@ -403,31 +429,32 @@ void __fastcall hk_CtrlBattleSync(void* pBattleBase) {
             if (curFrame > s_MatchPeakSyncFrame) {
                 s_MatchPeakSyncFrame     = curFrame;
                 s_MatchStallsAtPeakFrame = g_Telemetry.lockstepStallFrames.load(std::memory_order_relaxed) - s_MatchStartStallCount;
+                if (!s_OpeningSettleCaptured && curFrame >= 45) {
+                    s_OpeningSettleCaptured = true;
+                    s_OpeningSettleStalls   = s_MatchStallsAtPeakFrame;
+                }
             }
 
-            // Real-time intra-match live recalibration (frames 90 .. 720 = 1.5s .. 12s)
-            // ONLY for active battlers (spectators do not transmit inputs or negotiate delay)
-            if (!isSpectator && !s_EarlyFightEvaluated && curFrame >= 90 && curFrame <= 720 && (curFrame - s_LastLiveShieldEvalFrame >= 45)) {
+            // Real-time intra-match live recalibration (frames 150 .. 900, measured post-opening frame 45)
+            // Absorbs genuine mid-fight jitter with extra UDP redundancy & poll spin without locking permanent rematch delay
+            if (!isSpectator && !s_EarlyFightEvaluated && s_OpeningSettleCaptured &&
+                curFrame >= 150 && curFrame <= 900 && (curFrame - s_LastLiveShieldEvalFrame >= 45)) {
                 s_LastLiveShieldEvalFrame = curFrame;
-                const uint64_t currentStalls = s_MatchStallsAtPeakFrame;
-                // If >= 3 stalls or >= 2.0% stall ratio during the first seconds:
-                if (currentStalls >= 3 && (static_cast<double>(currentStalls) / static_cast<double>(curFrame)) >= 0.020) {
+                const uint64_t steadyStalls = (s_MatchStallsAtPeakFrame >= s_OpeningSettleStalls)
+                    ? (s_MatchStallsAtPeakFrame - s_OpeningSettleStalls)
+                    : s_MatchStallsAtPeakFrame;
+                const int32_t evalSpan = std::max(1, curFrame - 45);
+                if (steadyStalls >= 4 && (static_cast<double>(steadyStalls) / static_cast<double>(evalSpan)) >= 0.025) {
                     s_EarlyFightEvaluated = true;
                     g_LiveAntiJitterActive.store(true);
                     const int32_t shieldDepth = (g_Battler0HasMod.load() && g_Battler1HasMod.load()) ? 4 : 3;
                     g_LiveAntiJitterRedundancyDepth.store(shieldDepth);
                     g_LiveAntiJitterSpinUs.store(1600);
 
-                    // Pre-arm rematch cushion so rematch starts optimal
-                    if (g_PeerDynamicJitterBoostFrames.load() == 0) {
-                        g_PeerDynamicJitterBoostFrames.store(1);
-                        g_Telemetry.dynamicJitterBoostFrames.store(1);
-                    }
-
-                    LogNetcode("[AutoTune-Live] Early-fight jitter detected (%llu stalls at Frame %d, %0.1f%%) -> Max Jitter Shield ENGAGED (Redundancy=%d, Spin=1600us, RTT-Paced FastNACK)!",
-                               static_cast<unsigned long long>(currentStalls),
-                               curFrame,
-                               (static_cast<double>(currentStalls) / static_cast<double>(curFrame)) * 100.0,
+                    LogNetcode("[AutoTune-Live] Mid-fight jitter detected (%llu stalls over %d f, %0.1f%%) -> Max Jitter Shield ENGAGED (Redundancy=%d, Spin=1600us, RTT-Paced FastNACK)!",
+                               static_cast<unsigned long long>(steadyStalls),
+                               evalSpan,
+                               (static_cast<double>(steadyStalls) / static_cast<double>(evalSpan)) * 100.0,
                                shieldDepth);
                 }
             }
@@ -435,8 +462,13 @@ void __fastcall hk_CtrlBattleSync(void* pBattleBase) {
         if (pSync->m_bIsStarted && (totalTicks % 300 == 0)) {
             const uint64_t personaSaves  = g_Telemetry.personaPageBoundarySaves.load();
             const uint64_t lobbySaves    = g_Telemetry.lobbySlotNullDerefSaves.load();
-            const uint64_t totalCrashSvs = personaSaves + lobbySaves;
-            LogNetcode("[Telemetry] Frame=%d | RTT=%d ms | Delay=%d f | Pkts=%llu (Aux=%llu) | RedundantFrms=%llu | JitterSaved=%llu | FastNACKs=%llu | Stalls=%llu | CrashSaves=%llu (Persona=%llu, LobbySlot=%llu)",
+            const uint64_t vkSaves       = g_Telemetry.virtualKeyboardNullSaves.load();
+            const uint64_t sessDiscSaves = g_Telemetry.sessionDisconnectNullSaves.load();
+            const uint64_t dupSlotSaves  = g_Telemetry.duplicateLobbySlotSaves.load();
+            const uint64_t lobbyWaitSvs  = g_Telemetry.lobbyWaitDeadlockSaves.load();
+            const uint64_t chatTplSvs    = g_Telemetry.chatTemplateCrashSaves.load();
+            const uint64_t totalCrashSvs = personaSaves + lobbySaves + vkSaves + sessDiscSaves + dupSlotSaves + lobbyWaitSvs + chatTplSvs;
+            LogNetcode("[Telemetry] Frame=%d | RTT=%d ms | Delay=%d f | Pkts=%llu (Aux=%llu) | RedundantFrms=%llu | JitterSaved=%llu | FastNACKs=%llu | Stalls=%llu | CrashSaves=%llu (Persona=%llu, LobbySlot=%llu, VKeyboard=%llu, SessDisc=%llu, DupSlot=%llu, LobbyWait=%llu, ChatTpl=%llu)",
                        pSync->m_pInputBuffer ? pSync->m_pInputBuffer->m_currentSyncFrame : -1,
                        g_Telemetry.lastRawRttMs.load(),
                        pSync->m_netDelayFrames,
@@ -448,7 +480,12 @@ void __fastcall hk_CtrlBattleSync(void* pBattleBase) {
                        static_cast<unsigned long long>(g_Telemetry.lockstepStallFrames.load()),
                        static_cast<unsigned long long>(totalCrashSvs),
                        static_cast<unsigned long long>(personaSaves),
-                       static_cast<unsigned long long>(lobbySaves));
+                       static_cast<unsigned long long>(lobbySaves),
+                       static_cast<unsigned long long>(vkSaves),
+                       static_cast<unsigned long long>(sessDiscSaves),
+                       static_cast<unsigned long long>(dupSlotSaves),
+                       static_cast<unsigned long long>(lobbyWaitSvs),
+                       static_cast<unsigned long long>(chatTplSvs));
         }
     }
 }
@@ -562,23 +599,40 @@ void InitializeNetcodeHooks() {
     }
 
     // Exact .pdata-verified prologues from NSUNSC.exe
-    static constexpr uint8_t kPrologue_CopyPersonaA[]       = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20 };
-    static constexpr uint8_t kPrologue_CopyPersonaB[]       = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9 };
-    static constexpr uint8_t kPrologue_GetPersonaWrap[]     = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x19 };
+    static constexpr uint8_t kPrologue_CopyPersonaA[]         = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20 };
+    static constexpr uint8_t kPrologue_CopyPersonaB[]         = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9 };
+    static constexpr uint8_t kPrologue_GetPersonaWrap[]       = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x19 };
+    static constexpr uint8_t kPrologue_KeyboardGetChar[]      = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20 };
+    static constexpr uint8_t kPrologue_KeyboardGetKey[]       = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x05, 0xD3, 0x1E, 0x54, 0x08 };
+    static constexpr uint8_t kPrologue_SessionSendPkt[]       = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48 };
+    static constexpr uint8_t kPrologue_SessionBroadcastPkt[]  = { 0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x20 };
+    static constexpr uint8_t kPrologue_SessionGetMySlot[]     = { 0x48, 0x8B, 0x49, 0x20, 0x33, 0xD2, 0x48, 0x8D, 0x41, 0x18, 0x48, 0x85, 0xC0, 0x48, 0x0F, 0x44 };
+    static constexpr uint8_t kPrologue_SessionSortSlots[]     = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x99, 0x00, 0x05, 0x00 };
+    static constexpr uint8_t kPrologue_SessionProcessMsgs[]   = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89, 0x7C, 0x24, 0x20, 0x55 };
+    static constexpr uint8_t kPrologue_SessionAddMember[]     = { 0x40, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x4C, 0x8B, 0xF9, 0x49, 0x8B, 0xE8 };
+    static constexpr uint8_t kPrologue_SessionAssignUId[]     = { 0xFF, 0x81, 0x68, 0x01, 0x00, 0x00, 0x8B, 0x81, 0x68, 0x01, 0x00, 0x00, 0x89, 0x02, 0xC3 };
+    static constexpr uint8_t kPrologue_SessionInvokeCb[]      = { 0x4C, 0x8B, 0x89, 0x58, 0x06, 0x00, 0x00, 0x49, 0x8B, 0xC9, 0x49, 0x8B, 0x41, 0x08, 0x80, 0x78 };
+    static constexpr uint8_t kPrologue_CustomUpdateBattle[]   = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57 };
+    static constexpr uint8_t kPrologue_CustomUpdateUsers[]    = { 0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57 };
+    static constexpr uint8_t kPrologue_TeamGetByIndex[]       = { 0x44, 0x8B, 0xC2, 0x4C, 0x39, 0x41, 0x50 };
+    static constexpr uint8_t kPrologue_TeamFindByCharId[]     = { 0x48, 0x8B, 0x49, 0x48, 0x44, 0x8B, 0xCA };
+    static constexpr uint8_t kPrologue_TeamFindByIndex[]      = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57 };
+    static constexpr uint8_t kPrologue_ChatTplClearDynamic[]  = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57 };
 
-    static constexpr uint8_t kPrologue_CtrlBattleSync[]     = { 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x30 };
-    static constexpr uint8_t kPrologue_CalcNetFrame[]       = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20 };
-    static constexpr uint8_t kPrologue_SetupFrameSync[]     = { 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20 };
-    static constexpr uint8_t kPrologue_UpdateMemberDly[]    = { 0x40, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x83, 0x79, 0x4C, 0x00 };
-    static constexpr uint8_t kPrologue_BuildSendPacket[]    = { 0x40, 0x53, 0x55, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x60 };
-    static constexpr uint8_t kPrologue_SendSpectatorPkt[]   = { 0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x6C, 0x24, 0x20, 0x57, 0x48, 0x83, 0xEC, 0x50 };
-    static constexpr uint8_t kPrologue_ReceivePackets[]     = { 0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57, 0x41, 0x55 };
-    static constexpr uint8_t kPrologue_ReceiveWatcherPkts[] = { 0x40, 0x55, 0x56, 0x57, 0x41, 0x55, 0x48, 0x8D, 0xAC, 0x24, 0x78, 0xF8, 0xFF, 0xFF };
-    static constexpr uint8_t kPrologue_SyncBaseInit[]       = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18 };
-    static constexpr uint8_t kPrologue_RecvHostWorstRtt[]   = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20 };
-    static constexpr uint8_t kPrologue_RecvClientRtt[]      = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54 };
-    static constexpr uint8_t kPrologue_ReliableSend[]       = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18 };
-    static constexpr uint8_t kPrologue_NuccD3D11Present[]   = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9 };
+    static constexpr uint8_t kPrologue_CtrlBattleSync[]       = { 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x30 };
+    static constexpr uint8_t kPrologue_CalcNetFrame[]         = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20 };
+    static constexpr uint8_t kPrologue_SetupFrameSync[]       = { 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20 };
+    static constexpr uint8_t kPrologue_UpdateMemberDly[]      = { 0x40, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x83, 0x79, 0x4C, 0x00 };
+    static constexpr uint8_t kPrologue_BuildSendPacket[]      = { 0x40, 0x53, 0x55, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x60 };
+    static constexpr uint8_t kPrologue_SendSpectatorPkt[]     = { 0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x6C, 0x24, 0x20, 0x57, 0x48, 0x83, 0xEC, 0x50 };
+    static constexpr uint8_t kPrologue_SendWatcherRelayPkt[]  = { 0x40, 0x56, 0x48, 0x81, 0xEC, 0x10, 0x01, 0x00, 0x00 };
+    static constexpr uint8_t kPrologue_ReceivePackets[]       = { 0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57, 0x41, 0x55 };
+    static constexpr uint8_t kPrologue_ReceiveWatcherPkts[]   = { 0x40, 0x55, 0x56, 0x57, 0x41, 0x55, 0x48, 0x8D, 0xAC, 0x24, 0x78, 0xF8, 0xFF, 0xFF };
+    static constexpr uint8_t kPrologue_SyncBaseInit[]         = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18 };
+    static constexpr uint8_t kPrologue_RecvHostWorstRtt[]     = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20 };
+    static constexpr uint8_t kPrologue_RecvClientRtt[]        = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54 };
+    static constexpr uint8_t kPrologue_ReliableSend[]         = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18 };
+    static constexpr uint8_t kPrologue_NuccD3D11Present[]     = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9 };
 
     int installedCount = 0;
     int expectedCount  = 0;
@@ -598,11 +652,27 @@ void InitializeNetcodeHooks() {
         }
     }
 
-    if (g_Config.fix_online_persona_crash) {
+    if (g_Config.fix_online_persona_crash || g_Config.enable_netcode_overhaul) {
         const HookDescriptor crashFixHooks[] = {
-            { "Steam::GetFriendPersonaName (SafeRing)",    StormRva::kSteam_GetFriendPersonaName,   kPrologue_GetPersonaWrap, sizeof(kPrologue_GetPersonaWrap), reinterpret_cast<LPVOID>(&hk_SteamGetFriendPersonaName),    reinterpret_cast<LPVOID*>(&oSteamGetPersonaWrapper) },
-            { "Steam::CopyFriendPersonaNameA (+0x10BAD24)",StormRva::kSteam_CopyFriendPersonaNameA, kPrologue_CopyPersonaA,   sizeof(kPrologue_CopyPersonaA),   reinterpret_cast<LPVOID>(&hk_SteamCopyFriendPersonaNameA), reinterpret_cast<LPVOID*>(&oSteamCopyPersonaA) },
-            { "Steam::CopyFriendPersonaNameB (+0x0847A67)",StormRva::kSteam_CopyFriendPersonaNameB, kPrologue_CopyPersonaB,   sizeof(kPrologue_CopyPersonaB),   reinterpret_cast<LPVOID>(&hk_SteamCopyFriendPersonaNameB), reinterpret_cast<LPVOID*>(&oSteamCopyPersonaB) },
+            { "Steam::GetFriendPersonaName (SafeRing)",      StormRva::kSteam_GetFriendPersonaName,      kPrologue_GetPersonaWrap,      sizeof(kPrologue_GetPersonaWrap),      reinterpret_cast<LPVOID>(&hk_SteamGetFriendPersonaName),        reinterpret_cast<LPVOID*>(&oSteamGetPersonaWrapper) },
+            { "Steam::CopyFriendPersonaNameA (+0x10BAD24)",  StormRva::kSteam_CopyFriendPersonaNameA,    kPrologue_CopyPersonaA,        sizeof(kPrologue_CopyPersonaA),        reinterpret_cast<LPVOID>(&hk_SteamCopyFriendPersonaNameA),     reinterpret_cast<LPVOID*>(&oSteamCopyPersonaA) },
+            { "Steam::CopyFriendPersonaNameB (+0x0847A67)",  StormRva::kSteam_CopyFriendPersonaNameB,    kPrologue_CopyPersonaB,        sizeof(kPrologue_CopyPersonaB),        reinterpret_cast<LPVOID>(&hk_SteamCopyFriendPersonaNameB),     reinterpret_cast<LPVOID*>(&oSteamCopyPersonaB) },
+            { "Input::KeyboardGetPressedKey (+0x120FFB5)",   StormRva::kInput_KeyboardGetPressedKey,     kPrologue_KeyboardGetKey,      sizeof(kPrologue_KeyboardGetKey),      reinterpret_cast<LPVOID>(&hk_KeyboardGetPressedKey),         reinterpret_cast<LPVOID*>(&oKeyboardGetPressedKey) },
+            { "Input::KeyboardGetPressedChar (+0x120FEE0)",  StormRva::kInput_KeyboardGetPressedChar,    kPrologue_KeyboardGetChar,     sizeof(kPrologue_KeyboardGetChar),     reinterpret_cast<LPVOID>(&hk_KeyboardGetPressedChar),        reinterpret_cast<LPVOID*>(&oKeyboardGetPressedChar) },
+            { "SessionComm::SendPacket (+0x1169290)",        StormRva::kSessionComm_SendPacket,          kPrologue_SessionSendPkt,      sizeof(kPrologue_SessionSendPkt),      reinterpret_cast<LPVOID>(&hk_SessionCommSendPacket),         reinterpret_cast<LPVOID*>(&oSessionCommSendPkt) },
+            { "SessionComm::BroadcastPacket (+0x1169310)",   StormRva::kSessionComm_BroadcastPacket,     kPrologue_SessionBroadcastPkt, sizeof(kPrologue_SessionBroadcastPkt), reinterpret_cast<LPVOID>(&hk_SessionCommBroadcastPacket),    reinterpret_cast<LPVOID*>(&oSessionCommBroadcastPkt) },
+            { "Session::GetMySlot (+0x10B8E20)",             StormRva::kSession_GetMySlot,               kPrologue_SessionGetMySlot,    sizeof(kPrologue_SessionGetMySlot),    reinterpret_cast<LPVOID>(&hk_SessionGetMySlot),              reinterpret_cast<LPVOID*>(&oSessionGetMySlot) },
+            { "Session::SortSlotsAndRefresh (+0x113FA50)",   StormRva::kSession_SortSlots,               kPrologue_SessionSortSlots,    sizeof(kPrologue_SessionSortSlots),    reinterpret_cast<LPVOID>(&hk_SessionSortSlotsAndRefreshMySlot), reinterpret_cast<LPVOID*>(&oSessionSortSlots) },
+            { "Session::ProcessMessages (+0x116DAE0)",       StormRva::kSession_ProcessMessages,         kPrologue_SessionProcessMsgs,  sizeof(kPrologue_SessionProcessMsgs),  reinterpret_cast<LPVOID>(&hk_SessionProcessReceivedMessages), reinterpret_cast<LPVOID*>(&oSessionProcessMsgs) },
+            { "Session::AddMemberToTable (+0x113AF60)",      StormRva::kSessionData_AddMember,           kPrologue_SessionAddMember,    sizeof(kPrologue_SessionAddMember),    reinterpret_cast<LPVOID>(&hk_SessionAddMemberToTable),       reinterpret_cast<LPVOID*>(&oSessionAddMember) },
+            { "Session::AssignNextUId (+0x113B3C0)",         StormRva::kSession_AssignNextUId,           kPrologue_SessionAssignUId,    sizeof(kPrologue_SessionAssignUId),    reinterpret_cast<LPVOID>(&hk_SessionAssignNextUId),          reinterpret_cast<LPVOID*>(&oSessionAssignNextUId) },
+            { "Session::InvokeCallback (+0x113D840)",        StormRva::kSession_InvokeCallback,          kPrologue_SessionInvokeCb,     sizeof(kPrologue_SessionInvokeCb),     reinterpret_cast<LPVOID>(&hk_SessionInvokeCallback),         reinterpret_cast<LPVOID*>(&oSessionInvokeCallback) },
+            { "CustomLobby::UpdateBattleTable (+0x00F4310)", StormRva::kCustomLobby_UpdateBattleTable,   kPrologue_CustomUpdateBattle,  sizeof(kPrologue_CustomUpdateBattle),  reinterpret_cast<LPVOID>(&hk_CustomLobbyUpdateBattleTable),  reinterpret_cast<LPVOID*>(&oCustomLobbyUpdateBattleTbl) },
+            { "CustomLobbyUi::UpdateUserList (+0x00FF810)",  StormRva::kCustomLobbyUi_UpdateUserList,    kPrologue_CustomUpdateUsers,   sizeof(kPrologue_CustomUpdateUsers),   reinterpret_cast<LPVOID>(&hk_CustomLobbyUiUpdateUserList),   reinterpret_cast<LPVOID*>(&oCustomLobbyUiUpdateUsers) },
+            { "TeamContainer::GetByIndex (+0x094B3ED)",      StormRva::kTeamContainer_GetByIndex,        kPrologue_TeamGetByIndex,      sizeof(kPrologue_TeamGetByIndex),      reinterpret_cast<LPVOID>(&hk_TeamContainerGetByIndex),       reinterpret_cast<LPVOID*>(&oTeamContainerGetByIndex) },
+            { "TeamContainer::FindByCharId (+0x094B837)",    StormRva::kTeamContainer_FindByCharId,      kPrologue_TeamFindByCharId,    sizeof(kPrologue_TeamFindByCharId),    reinterpret_cast<LPVOID>(&hk_TeamContainerFindByCharId),     reinterpret_cast<LPVOID*>(&oTeamContainerFindByCharId) },
+            { "TeamContainer::FindByIndex (+0x094B8D8)",     StormRva::kTeamContainer_FindByIndex,       kPrologue_TeamFindByIndex,     sizeof(kPrologue_TeamFindByIndex),     reinterpret_cast<LPVOID>(&hk_TeamContainerFindByIndex),      reinterpret_cast<LPVOID*>(&oTeamContainerFindByIndex) },
+            { "ChatTemplate::ClearDynamic (+0x0150C90)",     StormRva::kChatTemplate_ClearDynamic,      kPrologue_ChatTplClearDynamic, sizeof(kPrologue_ChatTplClearDynamic), reinterpret_cast<LPVOID>(&hk_ChatTemplateClearDynamic),      reinterpret_cast<LPVOID*>(&oChatTemplateClearDynamic) },
         };
         expectedCount += static_cast<int>(std::size(crashFixHooks));
         for (const auto& h : crashFixHooks) {
@@ -620,6 +690,7 @@ void InitializeNetcodeHooks() {
             { "ccNetFreeBattleSync::UpdateMemberDelay",     StormRva::kFreeSync_UpdateMemberDelay,      kPrologue_UpdateMemberDly,   sizeof(kPrologue_UpdateMemberDly),   reinterpret_cast<LPVOID>(&hk_UpdateMemberCountAndDelay), reinterpret_cast<LPVOID*>(&oUpdateMemberDelay) },
             { "ccNetFreeBattleSync::BuildSendPacket",       StormRva::kFreeSync_BuildSendPacket,        kPrologue_BuildSendPacket,   sizeof(kPrologue_BuildSendPacket),   reinterpret_cast<LPVOID>(&hk_BuildBattlerSendPacket),    reinterpret_cast<LPVOID*>(&oBuildSendPacket) },
             { "ccNetFreeBattleSync::SendSpectatorPacket",   StormRva::kFreeSync_SendSpectatorPacket,    kPrologue_SendSpectatorPkt,  sizeof(kPrologue_SendSpectatorPkt),  reinterpret_cast<LPVOID>(&hk_SendSpectatorPacket),       reinterpret_cast<LPVOID*>(&oSendSpectatorPacket) },
+            { "ccNetFreeBattleSync::SendWatcherRelayPacket",StormRva::kFreeSync_SendWatcherRelayPacket, kPrologue_SendWatcherRelayPkt,sizeof(kPrologue_SendWatcherRelayPkt),reinterpret_cast<LPVOID>(&hk_SendWatcherRelayPacket),   reinterpret_cast<LPVOID*>(&oSendWatcherRelayPacket) },
             { "ccNetFreeBattleSync::ReceivePackets",        StormRva::kFreeSync_ReceivePackets,         kPrologue_ReceivePackets,    sizeof(kPrologue_ReceivePackets),    reinterpret_cast<LPVOID>(&hk_ReceivePackets),            reinterpret_cast<LPVOID*>(&oReceivePackets) },
             { "ccNetFreeBattleSync::ReceiveWatcherPackets", StormRva::kFreeSync_ReceiveWatcherPackets,  kPrologue_ReceiveWatcherPkts,sizeof(kPrologue_ReceiveWatcherPkts),reinterpret_cast<LPVOID>(&hk_ReceiveWatcherPackets),     reinterpret_cast<LPVOID*>(&oReceiveWatcherPackets) },
             { "ccSceneNetworkBattleSyncBase::Initialize",   StormRva::kSyncBase_Initialize,             kPrologue_SyncBaseInit,      sizeof(kPrologue_SyncBaseInit),      reinterpret_cast<LPVOID>(&hk_SyncBase_Initialize),       reinterpret_cast<LPVOID*>(&oSyncBaseInit) },
@@ -635,18 +706,21 @@ void InitializeNetcodeHooks() {
         }
     }
 
+    InstallLobbyWaitDeadlockHooks(&installedCount, &expectedCount);
     LogNetcode("[Init] %d/%d .pdata-verified hooks active.", installedCount, expectedCount);
     ApplyProcessGamingBoost();
     ApplyWifiGamingLowLatencyMode(true);
 }
 
-void ShutdownNetcodeHooks() {
+void ShutdownNetcodeHooks(bool processTerminating) {
     using namespace StormInternal;
 
-    ShutdownWifiGamingLowLatencyMode();
-    ShutdownProcessGamingBoost();
-    MH_DisableHook(MH_ALL_HOOKS);
-    MH_Uninitialize();
-    RemoveLobbySlotNullFixBridge();
-    RestoreVerifiedBytePatches();
+    ShutdownWifiGamingLowLatencyMode(processTerminating);
+    ShutdownProcessGamingBoost(processTerminating);
+    if (!processTerminating) {
+        MH_DisableHook(MH_ALL_HOOKS);
+        MH_Uninitialize();
+        RemoveLobbySlotNullFixBridge();
+        RestoreVerifiedBytePatches();
+    }
 }
