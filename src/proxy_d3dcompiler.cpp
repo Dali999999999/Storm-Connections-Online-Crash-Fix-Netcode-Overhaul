@@ -9,6 +9,7 @@ namespace {
 using GenericD3DFn = uintptr_t(WINAPI*)(
     uintptr_t, uintptr_t, uintptr_t, uintptr_t,
     uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+    uintptr_t, uintptr_t, uintptr_t, uintptr_t,
     uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 
 enum ExportIndex : size_t {
@@ -89,7 +90,8 @@ BOOL CALLBACK InitProxyCallback(PINIT_ONCE, PVOID, PVOID*) {
         if (pos != std::wstring::npos) {
             const wchar_t* candidates[] = {
                 L"\\d3dcompiler_47_original.dll",
-                L"\\d3dcompiler_47_o.dll"
+                L"\\d3dcompiler_47_o.dll",
+                L"\\d3dcompiler_47o.dll"
             };
             for (const wchar_t* suffix : candidates) {
                 std::wstring chainPath = dir.substr(0, pos) + suffix;
@@ -131,11 +133,12 @@ __forceinline GenericD3DFn GetExportFn(ExportIndex idx) {
     extern "C" uintptr_t WINAPI Name(                                                           \
         uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,                                 \
         uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8,                                 \
-        uintptr_t a9, uintptr_t a10, uintptr_t a11, uintptr_t a12)                              \
+        uintptr_t a9, uintptr_t a10, uintptr_t a11, uintptr_t a12,                              \
+        uintptr_t a13, uintptr_t a14, uintptr_t a15, uintptr_t a16)                             \
     {                                                                                           \
         GenericD3DFn fn = GetExportFn(idx_##Name);                                              \
         if (!fn) return static_cast<uintptr_t>(E_FAIL);                                         \
-        return fn(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);                           \
+        return fn(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16);       \
     }
 
 } // namespace

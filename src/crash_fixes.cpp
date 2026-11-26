@@ -349,19 +349,218 @@ bool IsKeyboardKeyMapSafeToQuery(const void* pKeyMap, const char* hookTag) noexc
     return true;
 }
 
+constexpr uintptr_t kMaxValidUserPtr = 0x00007FFFFFFFFFFFULL;
+
+// Detaches [pVkImpl + 0xC0] (ccSimpleCommand<ccNetIdSearchState>*) if it targets pThis.
+// Must run BEFORE closing ccVirtualKeyboard_Win64::Reset so STEP_END cannot invoke the
+// callback on a ccNetIdSearchState currently being destroyed.
+bool DetachVirtualKeyboardCallbackSeh(void* pThis, void** outVkImpl, void** outCmd, bool* outWasOpen) noexcept {
+    *outVkImpl  = nullptr;
+    *outCmd     = nullptr;
+    *outWasOpen = false;
+    if (!g_BaseAddress) {
+        return false;
+    }
+    const uintptr_t targetAddr = reinterpret_cast<uintptr_t>(pThis);
+    if (targetAddr < 0x10000ULL || targetAddr > kMaxValidUserPtr) {
+        return false;
+    }
+    __try {
+        const uintptr_t pVkWrapper = *reinterpret_cast<const uintptr_t*>(g_BaseAddress + StormRva::kGlobalVirtualKeyboardPtr);
+        if (pVkWrapper < 0x10000ULL || pVkWrapper > kMaxValidUserPtr) {
+            return false;
+        }
+        const uintptr_t pVkImpl = *reinterpret_cast<const uintptr_t*>(pVkWrapper + 0x18);
+        if (pVkImpl < 0x10000ULL || pVkImpl > kMaxValidUserPtr) {
+            return false;
+        }
+        const uintptr_t pCmd = *reinterpret_cast<const uintptr_t*>(pVkImpl + 0xC0);
+        if (pCmd < 0x10000ULL || pCmd > kMaxValidUserPtr) {
+            return false;
+        }
+        const uintptr_t cmdVtbl   = *reinterpret_cast<const uintptr_t*>(pCmd + 0x00);
+        const uintptr_t cmdTarget = *reinterpret_cast<const uintptr_t*>(pCmd + 0x08);
+        if (cmdVtbl != (g_BaseAddress + StormRva::kVtbl_SimpleCmdNetIdSearch) || cmdTarget != targetAddr) {
+            return false;
+        }
+        const bool wasOpen = (*reinterpret_cast<const int32_t*>(pVkImpl + 0x18) == 0);
+        *reinterpret_cast<uintptr_t*>(pVkImpl + 0xC0) = 0;
+        *outVkImpl  = reinterpret_cast<void*>(pVkImpl);
+        *outCmd     = reinterpret_cast<void*>(pCmd);
+        *outWasOpen = wasOpen;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void CloseVirtualKeyboardImplSeh(void* pVkImpl) noexcept {
+    if (!pVkImpl) {
+        return;
+    }
+    __try {
+        if (g_fnVirtualKeyboardReset) {
+            // [pVkImpl + 0xC0] is already NULL, so Reset safely frees m_buffer and sets state = -1
+            // without invoking OnVirtualKeyboardFinish.
+            g_fnVirtualKeyboardReset(pVkImpl);
+        } else {
+            *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(pVkImpl) + 0x18) = -1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// Mirrors ccVirtualKeyboard_Win64::Reset (+0x10C78AE..+0x10C78FD): pushes pVkImpl's NUCC heap,
+// calls ccSimpleCommand<ccNetIdSearchState>'s scalar deleting dtor (vtable[0](cmd, 1)), then pops heap.
+void DestroyDetachedSimpleCommandSeh(void* pVkImpl, void* pCmd) noexcept {
+    if (!pVkImpl || !pCmd) {
+        return;
+    }
+    __try {
+        const auto* implVtbl = *reinterpret_cast<uintptr_t* const*>(pVkImpl);
+        const auto* cmdVtbl  = *reinterpret_cast<uintptr_t* const*>(pCmd);
+        if (!implVtbl || !cmdVtbl) {
+            return;
+        }
+        const auto fnPushHeap = reinterpret_cast<void(__fastcall*)(void*)>(implVtbl[1]);
+        const auto fnPopHeap  = reinterpret_cast<void(__fastcall*)(void*)>(implVtbl[2]);
+        const auto fnCmdDtor  = reinterpret_cast<void*(__fastcall*)(void*, uint32_t)>(cmdVtbl[0]);
+        if (reinterpret_cast<uintptr_t>(fnPushHeap) < 0x10000ULL ||
+            reinterpret_cast<uintptr_t>(fnPopHeap)  < 0x10000ULL ||
+            reinterpret_cast<uintptr_t>(fnCmdDtor)  < 0x10000ULL) {
+            return;
+        }
+        fnPushHeap(pVkImpl);
+        fnCmdDtor(pCmd, 1u);
+        fnPopHeap(pVkImpl);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// Belt-and-suspenders guard for ccNetIdSearchState::OnVirtualKeyboardFinish (+0x170840 -> faults @ +0x170878).
+bool ValidateNetIdSearchStateForVkFinishSeh(void* pThis, const char** outReason) noexcept {
+    *outReason = nullptr;
+    if (!g_BaseAddress) {
+        return true;
+    }
+    const uintptr_t objAddr = reinterpret_cast<uintptr_t>(pThis);
+    if (objAddr < 0x10000ULL || objAddr > kMaxValidUserPtr) {
+        *outReason = "invalid pThis pointer";
+        return false;
+    }
+    __try {
+        const uintptr_t vtbl = *reinterpret_cast<const uintptr_t*>(objAddr);
+        if (vtbl != (g_BaseAddress + StormRva::kVtbl_NetIdSearchState)) {
+            *outReason = "freed/reused object (vtable mismatch)";
+            return false;
+        }
+        // Validate embedded std::string m_inputString @ +0x230 (_Ptr/_Buf @ +0x230, _Mysize @ +0x240, _Myres @ +0x248)
+        const uint64_t myRes = *reinterpret_cast<const uint64_t*>(objAddr + 0x248);
+        if (myRes >= 0x10ULL) {
+            if (myRes > 0x100000ULL) {
+                *outReason = "corrupt m_inputString._Myres";
+                return false;
+            }
+            const uintptr_t bufPtr = *reinterpret_cast<const uintptr_t*>(objAddr + 0x230);
+            if (bufPtr < 0x10000ULL || bufPtr > kMaxValidUserPtr) {
+                *outReason = "non-canonical/corrupt m_inputString._Ptr";
+                return false;
+            }
+            const volatile uint8_t probe = *reinterpret_cast<const volatile uint8_t*>(bufPtr);
+            (void)probe;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outReason = "SEH access violation probing ccNetIdSearchState";
+        return false;
+    }
+}
+
+// Re-acquires m_pKeyboard ([pVkImpl + 0x38]) if GetKeyboardDevice(0) previously returned NULL
+// when ccVirtualKeyboard_Win64::Start ran (otherwise keyboard stays mute until box is reopened).
+const void* TryRecoverVirtualKeyboardDeviceSeh() noexcept {
+    if (!g_BaseAddress || !g_fnGetKeyboardDevice) {
+        return nullptr;
+    }
+    __try {
+        const uintptr_t pInputMgr = *reinterpret_cast<const uintptr_t*>(g_BaseAddress + StormRva::kGlobalInputManagerPtr);
+        if (pInputMgr < 0x10000ULL || pInputMgr > kMaxValidUserPtr) {
+            return nullptr;
+        }
+        void* pKbd = g_fnGetKeyboardDevice(reinterpret_cast<void*>(pInputMgr), 0);
+        const uintptr_t kbdAddr = reinterpret_cast<uintptr_t>(pKbd);
+        if (kbdAddr < 0x10000ULL || kbdAddr > kMaxValidUserPtr) {
+            return nullptr;
+        }
+        const uintptr_t pVkWrapper = *reinterpret_cast<const uintptr_t*>(g_BaseAddress + StormRva::kGlobalVirtualKeyboardPtr);
+        if (pVkWrapper >= 0x10000ULL && pVkWrapper <= kMaxValidUserPtr) {
+            const uintptr_t pVkImpl = *reinterpret_cast<const uintptr_t*>(pVkWrapper + 0x18);
+            if (pVkImpl >= 0x10000ULL && pVkImpl <= kMaxValidUserPtr &&
+                *reinterpret_cast<const uintptr_t*>(pVkImpl + 0x38) == 0) {
+                *reinterpret_cast<uintptr_t*>(pVkImpl + 0x38) = kbdAddr;
+            }
+        }
+        return reinterpret_cast<const void*>(kbdAddr + 0x60);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// Returns true when ccVirtualKeyboard_Win64 is open (state == 0) in numeric-only mode (mode == 1,
+// used by ccNetIdSearchState for Session ID entry).
+bool IsVirtualKeyboardNumericModeActiveSeh() noexcept {
+    if (!g_BaseAddress) {
+        return false;
+    }
+    __try {
+        const uintptr_t pVkWrapper = *reinterpret_cast<const uintptr_t*>(g_BaseAddress + StormRva::kGlobalVirtualKeyboardPtr);
+        if (pVkWrapper < 0x10000ULL || pVkWrapper > kMaxValidUserPtr) {
+            return false;
+        }
+        const uintptr_t pVkImpl = *reinterpret_cast<const uintptr_t*>(pVkWrapper + 0x18);
+        if (pVkImpl < 0x10000ULL || pVkImpl > kMaxValidUserPtr) {
+            return false;
+        }
+        return (*reinterpret_cast<const int32_t*>(pVkImpl + 0x18) == 0) &&
+               (*reinterpret_cast<const int32_t*>(pVkImpl + 0x20) == 1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Maps USB HID top-row digits (0x1E..0x27) & Numpad digits (0x59..0x62) directly to ASCII '0'..'9',
+// fixing French AZERTY Shift+digit and Shifted Numpad producing '!'..')' / '\0' in numeric ID input.
+uint8_t MapNumericHidKeyToAsciiDigit(uint32_t hidKey) noexcept {
+    if (hidKey >= 0x1Eu && hidKey <= 0x26u) {
+        return static_cast<uint8_t>('1' + (hidKey - 0x1Eu));
+    }
+    if (hidKey == 0x27u) {
+        return static_cast<uint8_t>('0');
+    }
+    if (hidKey >= 0x59u && hidKey <= 0x61u) {
+        return static_cast<uint8_t>('1' + (hidKey - 0x59u));
+    }
+    if (hidKey == 0x62u) {
+        return static_cast<uint8_t>('0');
+    }
+    return 0;
+}
+
 // ============================================================================
 // Session Abrupt-Disconnect Null-Deref & Custom/Private Lobby Duplicate-Player
 // Helpers & State
 // ============================================================================
 
 constexpr uintptr_t kMinValidPtr = 0x10000ULL;
-alignas(64) uint8_t   s_SafeDummySessionSlot[0x48] = {};
+thread_local alignas(64) uint8_t s_SafeDummySessionSlot[0x48] = {};
 std::atomic<uint64_t> s_LastKnownLocalSteamId{0};
 std::atomic<uint64_t> s_LastAssignedMemberSteamId{0};
 std::atomic<int32_t>  s_LastAssignedMemberUId{0};
 std::atomic<bool>     s_LastAssignedMemberWasDuplicate{false};
 
 // Exact match to NSUNSC.exe!CSteamID::IsValid (0x14113C9E0)
+} // namespace
+
 bool IsValidSteamId(uint64_t steamId) noexcept {
     const uint32_t high = static_cast<uint32_t>(steamId >> 32);
     const uint32_t low  = static_cast<uint32_t>(steamId & 0xFFFFFFFFULL);
@@ -384,6 +583,8 @@ bool IsValidSteamId(uint64_t steamId) noexcept {
     }
     return true;
 }
+
+namespace {
 
 uint8_t* PrepareSafeDummySessionSlot() noexcept {
     std::memset(s_SafeDummySessionSlot, 0, sizeof(s_SafeDummySessionSlot));
@@ -470,37 +671,321 @@ bool ValidateTeamContainerTree(const void* pContainer, bool requireNonEmpty) noe
     }
 }
 
-// Deduplicates entries in Custom Lobby BattleTable[0..7] (stride 0x258, +0x00 = int32_t uId, +0x04 = int32_t status)
-void DeduplicateCustomLobbyBattleTable(uint8_t* pBattleTable, int32_t maxEntries, const char* contextTag) noexcept {
+// Looks up SteamID (0 if none) for a valid slot matching `uId` in m_slots[0..7] (stride 0x48)
+uint64_t FindSlotSteamIdByUId(const uint8_t* pSessionSlots, int32_t uId) noexcept {
+    if (uId < 0 || reinterpret_cast<uintptr_t>(pSessionSlots) < kMinValidPtr) {
+        return 0ULL;
+    }
+    for (int32_t i = 0; i < 8; ++i) {
+        const uint8_t* slotI = pSessionSlots + static_cast<size_t>(i) * 0x48;
+        if (*reinterpret_cast<const int32_t*>(slotI + 0x40) == uId) {
+            const uint64_t sid = *reinterpret_cast<const uint64_t*>(slotI + 0x38);
+            if (IsValidSteamId(sid)) {
+                return sid;
+            }
+        }
+    }
+    return 0ULL;
+}
+
+// Finds the canonical slot uId (>= 0) for a given SteamID in m_slots[0..7]
+int32_t FindCanonicalUIdBySteamId(const uint8_t* pSessionSlots, uint64_t steamId) noexcept {
+    if (!IsValidSteamId(steamId) || reinterpret_cast<uintptr_t>(pSessionSlots) < kMinValidPtr) {
+        return -1;
+    }
+    for (int32_t i = 0; i < 8; ++i) {
+        const uint8_t* slotI = pSessionSlots + static_cast<size_t>(i) * 0x48;
+        if (*reinterpret_cast<const uint64_t*>(slotI + 0x38) == steamId) {
+            const int32_t uid = *reinterpret_cast<const int32_t*>(slotI + 0x40);
+            if (uid >= 0) {
+                return uid;
+            }
+        }
+    }
+    return -1;
+}
+
+// Tracks recently scrubbed duplicate uIds (so BattleTable rows referencing them are wiped immediately)
+// and per-row orphan timers (so stale uIds missing from m_slots for >= 2s are cleared to -1,
+// preventing UpdateUserList @ 0x00FF810 from skipping the row and leaving a frozen duplicate UI card).
+constexpr size_t kMaxScrubbedOrphanUIds = 16;
+SRWLOCK  s_OrphanTrackLock = SRWLOCK_INIT;
+int32_t  s_ScrubbedOrphanUIds[kMaxScrubbedOrphanUIds] = { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1 };
+size_t   s_ScrubbedOrphanCursor = 0;
+int32_t  s_RowOrphanUId[8]      = { -1,-1,-1,-1,-1,-1,-1,-1 };
+uint64_t s_RowOrphanSinceMs[8]  = {};
+
+void RecordScrubbedOrphanUId(int32_t uId) noexcept {
+    if (uId < 0) return;
+    AcquireSRWLockExclusive(&s_OrphanTrackLock);
+    for (int32_t existing : s_ScrubbedOrphanUIds) {
+        if (existing == uId) {
+            ReleaseSRWLockExclusive(&s_OrphanTrackLock);
+            return;
+        }
+    }
+    s_ScrubbedOrphanUIds[s_ScrubbedOrphanCursor % kMaxScrubbedOrphanUIds] = uId;
+    ++s_ScrubbedOrphanCursor;
+    ReleaseSRWLockExclusive(&s_OrphanTrackLock);
+}
+
+bool IsScrubbedOrphanUId(int32_t uId) noexcept {
+    if (uId < 0) return false;
+    bool found = false;
+    AcquireSRWLockShared(&s_OrphanTrackLock);
+    for (int32_t existing : s_ScrubbedOrphanUIds) {
+        if (existing == uId) {
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&s_OrphanTrackLock);
+    return found;
+}
+
+void ClearScrubbedOrphanUIdIfActive(int32_t uId) noexcept {
+    if (uId < 0) return;
+    AcquireSRWLockExclusive(&s_OrphanTrackLock);
+    for (int32_t& existing : s_ScrubbedOrphanUIds) {
+        if (existing == uId) {
+            existing = -1;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_OrphanTrackLock);
+}
+
+// Scrubs duplicate SteamID slots in m_slots[0..7] (stride 0x48, +0x00/+0x38 = steamId, +0x40 = uId).
+// Matches OnMemberLeft (0x14113D486..0x14113D55A) & qsort comparator (0x1411407B0):
+//   - Empty slots MUST have all 0x48 bytes zeroed (uId == 0, NEVER -1, otherwise qsort sorts -1 to m_slots[0]!),
+//   - Valid slots are compacted into m_slots[0 .. validCount - 1] with m_pMySlot ([pSession + 0x500]) updated,
+//   - m_memberCount ([pData + 0x2C]) is synchronized to validCount when any duplicate/corrupt slot is scrubbed.
+void SanitizeSessionMemberSlots(uint8_t* pObj, bool isSessionObj, const char* contextTag) noexcept {
+    if (reinterpret_cast<uintptr_t>(pObj) < kMinValidPtr) {
+        return;
+    }
+    __try {
+        uint8_t* const pData     = isSessionObj ? (pObj + 0x184) : pObj;
+        uint8_t* const slotsBase = pData + 0x13C;
+
+        uint8_t* pSession = isSessionObj ? pObj : nullptr;
+        if (!pSession && g_BaseAddress) {
+            const uintptr_t pNetMgr = *reinterpret_cast<const uintptr_t*>(g_BaseAddress + StormRva::kGlobalNetManagerPtr);
+            if (pNetMgr >= kMinValidPtr) {
+                const uintptr_t pHolder = *reinterpret_cast<const uintptr_t*>(pNetMgr + 0x88);
+                if (pHolder >= kMinValidPtr) {
+                    const uintptr_t pSessCand = *reinterpret_cast<const uintptr_t*>(pHolder + 0x20);
+                    if (pSessCand >= kMinValidPtr && (pSessCand + 0x184ULL) == reinterpret_cast<uintptr_t>(pData)) {
+                        pSession = reinterpret_cast<uint8_t*>(pSessCand);
+                    }
+                }
+            }
+        }
+
+        uint8_t* mySlotPtr = pSession ? *reinterpret_cast<uint8_t**>(pSession + 0x500) : nullptr;
+        bool     modified  = false;
+
+        for (int32_t i = 0; i < 8; ++i) {
+            uint8_t* slotI = slotsBase + static_cast<size_t>(i) * 0x48;
+            const uint64_t sidI = *reinterpret_cast<const uint64_t*>(slotI + 0x38);
+            if (!IsValidSteamId(sidI)) {
+                if (*reinterpret_cast<const int32_t*>(slotI + 0x40) < 0) {
+                    std::memset(slotI, 0, 0x48);
+                    modified = true;
+                }
+                continue;
+            }
+            for (int32_t j = i + 1; j < 8; ++j) {
+                uint8_t* slotJ = slotsBase + static_cast<size_t>(j) * 0x48;
+                const uint64_t sidJ = *reinterpret_cast<const uint64_t*>(slotJ + 0x38);
+                if (sidJ != sidI) {
+                    continue;
+                }
+
+                // Prefer keeping m_pMySlot data if j is local player; move into slotI so lower slot stays canonical
+                const bool jIsMine = (mySlotPtr == slotJ && mySlotPtr != slotI);
+                const int32_t uidI = *reinterpret_cast<const int32_t*>(slotI + 0x40);
+                const int32_t uidJ = *reinterpret_cast<const int32_t*>(slotJ + 0x40);
+                const int32_t keepUId = jIsMine ? uidJ : uidI;
+                const int32_t dropUId = jIsMine ? uidI : uidJ;
+
+                if (jIsMine) {
+                    std::memcpy(slotI, slotJ, 0x48);
+                    mySlotPtr = slotI;
+                    if (pSession) {
+                        *reinterpret_cast<uint8_t**>(pSession + 0x500) = slotI;
+                    }
+                }
+
+                if (keepUId <= 0 && dropUId > 0) {
+                    *reinterpret_cast<int32_t*>(slotI + 0x40) = dropUId;
+                } else if (dropUId > 0 && dropUId != keepUId) {
+                    RecordScrubbedOrphanUId(dropUId);
+                }
+                std::memset(slotJ, 0, 0x48); // Must be 0 (uId == 0), never -1!
+                modified = true;
+
+                const uint64_t saveNum = g_Telemetry.duplicateLobbySlotSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (saveNum <= 32) {
+                    LogNetcode("[LobbyFix] Scrubbed duplicate m_slots[%d] (kept slot %d, uId=%d, dropped uId=%d) for SteamID 0x%llX in %s!",
+                               j, i, *reinterpret_cast<const int32_t*>(slotI + 0x40), dropUId,
+                               static_cast<unsigned long long>(sidI), contextTag);
+                }
+            }
+        }
+
+        if (modified) {
+            int32_t writeIdx = 0;
+            for (int32_t readIdx = 0; readIdx < 8; ++readIdx) {
+                uint8_t* srcSlot = slotsBase + static_cast<size_t>(readIdx) * 0x48;
+                if (!IsValidSteamId(*reinterpret_cast<const uint64_t*>(srcSlot + 0x38))) {
+                    continue;
+                }
+                if (writeIdx != readIdx) {
+                    uint8_t* dstSlot = slotsBase + static_cast<size_t>(writeIdx) * 0x48;
+                    std::memcpy(dstSlot, srcSlot, 0x48);
+                    if (pSession && *reinterpret_cast<uint8_t**>(pSession + 0x500) == srcSlot) {
+                        *reinterpret_cast<uint8_t**>(pSession + 0x500) = dstSlot;
+                    }
+                }
+                ++writeIdx;
+            }
+            for (int32_t k = writeIdx; k < 8; ++k) {
+                std::memset(slotsBase + static_cast<size_t>(k) * 0x48, 0, 0x48);
+            }
+            *reinterpret_cast<int32_t*>(pData + 0x2C) = writeIdx;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// Deduplicates entries in Custom/Endless Lobby BattleTable[0..7] (stride 0x258, +0x00 = int32_t uId, +0x04 = int32_t status)
+// by identical uId, by distinct uIds belonging to the same SteamID, AND (when pruneOrphans is true) wipes
+// orphan uIds missing from m_slots[0..7] so UpdateUserList (0x00FF810) never skips the row and freezes a ghost clone.
+void DeduplicateCustomLobbyBattleTable(
+    uint8_t* pBattleTable, int32_t maxEntries, const uint8_t* pSessionSlots, const char* contextTag,
+    bool pruneOrphans = false) noexcept {
     if (reinterpret_cast<uintptr_t>(pBattleTable) < kMinValidPtr) {
         return;
     }
     const int32_t limit = std::clamp(maxEntries, 1, 8);
-    for (int32_t i = 0; i < limit; ++i) {
-        uint8_t* entryI = pBattleTable + static_cast<size_t>(i) * 0x258;
-        const int32_t uidI    = *reinterpret_cast<const int32_t*>(entryI + 0x00);
-        const int32_t statusI = *reinterpret_cast<const int32_t*>(entryI + 0x04);
-        if (uidI < 0 || statusI < 0) {
-            continue;
-        }
-        for (int32_t j = i + 1; j < limit; ++j) {
-            uint8_t* entryJ = pBattleTable + static_cast<size_t>(j) * 0x258;
-            const int32_t uidJ    = *reinterpret_cast<const int32_t*>(entryJ + 0x00);
-            const int32_t statusJ = *reinterpret_cast<const int32_t*>(entryJ + 0x04);
-            if (uidJ == uidI && statusJ >= 0) {
-                // If entryJ has a newer active status (e.g. 0=fighter or 5=waiting vs 6=initial join), keep it in entryI
-                if (statusI == 6 && statusJ != 6) {
-                    *reinterpret_cast<int32_t*>(entryI + 0x04) = statusJ;
-                }
-                *reinterpret_cast<int32_t*>(entryJ + 0x00) = -1;
-                *reinterpret_cast<int32_t*>(entryJ + 0x04) = -1;
-                const uint64_t saveNum = g_Telemetry.duplicateLobbySlotSaves.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (saveNum <= 16) {
-                    LogNetcode("[LobbyFix] Cleared duplicate BattleTable row (%d & %d) for uId=%d in %s!",
-                               i, j, uidI, contextTag);
+    __try {
+        bool hasAnyValidSessionSlot = false;
+        if (reinterpret_cast<uintptr_t>(pSessionSlots) >= kMinValidPtr) {
+            for (int32_t s = 0; s < 8; ++s) {
+                const uint8_t* slotS = pSessionSlots + static_cast<size_t>(s) * 0x48;
+                if (IsValidSteamId(*reinterpret_cast<const uint64_t*>(slotS + 0x38)) &&
+                    *reinterpret_cast<const int32_t*>(slotS + 0x40) >= 0) {
+                    hasAnyValidSessionSlot = true;
+                    ClearScrubbedOrphanUIdIfActive(*reinterpret_cast<const int32_t*>(slotS + 0x40));
                 }
             }
         }
+
+        // Pass 1: Clear orphan BattleTable rows (uId not found in m_slots[0..7]) when pruneOrphans is enabled.
+        // Immediate wipe if uId was a known scrubbed duplicate; 2000ms grace period for unknown uIds (late NewMember).
+        if (pruneOrphans && hasAnyValidSessionSlot) {
+            const uint64_t nowMs = GetTickCount64();
+            for (int32_t i = 0; i < limit; ++i) {
+                uint8_t* entryI = pBattleTable + static_cast<size_t>(i) * 0x258;
+                const int32_t uidI    = *reinterpret_cast<const int32_t*>(entryI + 0x00);
+                const int32_t statusI = *reinterpret_cast<const int32_t*>(entryI + 0x04);
+                if (uidI < 0 || statusI < 0) {
+                    AcquireSRWLockExclusive(&s_OrphanTrackLock);
+                    s_RowOrphanUId[i]     = -1;
+                    s_RowOrphanSinceMs[i] = 0;
+                    ReleaseSRWLockExclusive(&s_OrphanTrackLock);
+                    continue;
+                }
+                const uint64_t sidI = FindSlotSteamIdByUId(pSessionSlots, uidI);
+                if (IsValidSteamId(sidI)) {
+                    AcquireSRWLockExclusive(&s_OrphanTrackLock);
+                    s_RowOrphanUId[i]     = -1;
+                    s_RowOrphanSinceMs[i] = 0;
+                    ReleaseSRWLockExclusive(&s_OrphanTrackLock);
+                    continue;
+                }
+
+                bool shouldWipe = IsScrubbedOrphanUId(uidI);
+                if (!shouldWipe) {
+                    AcquireSRWLockExclusive(&s_OrphanTrackLock);
+                    if (s_RowOrphanUId[i] != uidI) {
+                        s_RowOrphanUId[i]     = uidI;
+                        s_RowOrphanSinceMs[i] = nowMs;
+                    } else if (nowMs >= s_RowOrphanSinceMs[i] && (nowMs - s_RowOrphanSinceMs[i]) >= 2000ULL) {
+                        shouldWipe            = true;
+                        s_RowOrphanUId[i]     = -1;
+                        s_RowOrphanSinceMs[i] = 0;
+                    }
+                    ReleaseSRWLockExclusive(&s_OrphanTrackLock);
+                }
+
+                if (shouldWipe) {
+                    *reinterpret_cast<int32_t*>(entryI + 0x00) = -1;
+                    *reinterpret_cast<int32_t*>(entryI + 0x04) = -1;
+                    const uint64_t saveNum = g_Telemetry.duplicateLobbySlotSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (saveNum <= 32) {
+                        LogNetcode("[LobbyFix] Wiped orphan BattleTable[%d] (uId=%d absent from m_slots) in %s -> ghost UI card cleared!",
+                                   i, uidI, contextTag);
+                    }
+                }
+            }
+        }
+
+        // Pass 2: Deduplicate rows with identical uId or distinct uIds pointing to the same SteamID.
+        for (int32_t i = 0; i < limit; ++i) {
+            uint8_t* entryI = pBattleTable + static_cast<size_t>(i) * 0x258;
+            int32_t uidI    = *reinterpret_cast<const int32_t*>(entryI + 0x00);
+            int32_t statusI = *reinterpret_cast<const int32_t*>(entryI + 0x04);
+            if (uidI < 0 || statusI < 0) {
+                continue;
+            }
+            const uint64_t sidI = FindSlotSteamIdByUId(pSessionSlots, uidI);
+
+            for (int32_t j = i + 1; j < limit; ++j) {
+                uint8_t* entryJ = pBattleTable + static_cast<size_t>(j) * 0x258;
+                const int32_t uidJ    = *reinterpret_cast<const int32_t*>(entryJ + 0x00);
+                const int32_t statusJ = *reinterpret_cast<const int32_t*>(entryJ + 0x04);
+                if (uidJ < 0 || statusJ < 0) {
+                    continue;
+                }
+
+                const bool sameUId = (uidJ == uidI);
+                const uint64_t sidJ = (!sameUId && IsValidSteamId(sidI)) ? FindSlotSteamIdByUId(pSessionSlots, uidJ) : sidI;
+                const bool sameSteamId = !sameUId && IsValidSteamId(sidI) && (sidJ == sidI);
+                if (!sameUId && !sameSteamId) {
+                    continue;
+                }
+
+                bool clearI = false;
+                if (sameUId) {
+                    // If entryJ has a newer active status (e.g. 0=fighter or 5=waiting vs 6=initial join), keep it in entryI
+                    if (statusI == 6 && statusJ != 6) {
+                        *reinterpret_cast<int32_t*>(entryI + 0x04) = statusJ;
+                        statusI = statusJ;
+                    }
+                } else {
+                    // Two distinct uIds point to the same SteamID! Preserve the row matching m_slots' canonical uId.
+                    const int32_t canonUId = FindCanonicalUIdBySteamId(pSessionSlots, sidI);
+                    if (canonUId >= 0 && uidJ == canonUId && uidI != canonUId) {
+                        clearI = true;
+                    }
+                }
+
+                uint8_t* const cleared = clearI ? entryI : entryJ;
+                *reinterpret_cast<int32_t*>(cleared + 0x00) = -1;
+                *reinterpret_cast<int32_t*>(cleared + 0x04) = -1;
+
+                const uint64_t saveNum = g_Telemetry.duplicateLobbySlotSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (saveNum <= 32) {
+                    LogNetcode("[LobbyFix] Cleared duplicate BattleTable row (%d:uId=%d & %d:uId=%d, sid=0x%llX) in %s!",
+                               i, uidI, j, uidJ, static_cast<unsigned long long>(sidI), contextTag);
+                }
+                if (clearI) {
+                    break;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
 
@@ -609,6 +1094,127 @@ void CallChatTemplateClearDynamicSafe(void* pManager, bool* pFaulted) noexcept {
     }
 }
 
+// ============================================================================
+// ccSpSkillCustomizeParam (data/spc/spSkillCustomizeParam.xfbin) &
+// ccPreSetSaveData OOB spAtkIndex Crash Fixes (NSUNSC.exe+0x0702447 & twins)
+// ============================================================================
+// Each 0x98-byte RB-tree node in ccSpSkillCustomizeParam (loader @ +0x0701F70)
+// stores:
+//   +0x2C..+0x3F : float param1[5]  (indices 0..4, accessed by +0x0702220)
+//   +0x40..+0x53 : float param2[5]  (indices 0..4, accessed by +0x0702270)
+//   +0x58..+0x97 : { const char* msgId; uint32_t param; uint32_t pad; }[4]
+//                  (indices 0..3, accessed by +0x07022C0, +0x0702310, +0x0702400)
+// Unlike its sibling ccSkillCustomizeParam::GetSkillMessageId (+0x07015B0, which
+// checks `cmp r8d, 5`), none of these 5 indexed accessors bounds-check `r8d`.
+// A corrupted local or remote preset (e.g. spAtkIndex=0xB4800001) sign-extends
+// `movsxd rax, r8d` and reads `[rdx + rax*16 + 0x58]` -> 0xC0000005.
+
+constexpr uint32_t kMaxSpSkillFloatSlots = 5U;
+constexpr uint32_t kMaxSpSkillMsgSlots   = 4U;
+
+inline int32_t RecoverSafeSpSkillIndex(int32_t rawIndex, uint32_t maxSlots) noexcept {
+    const uint32_t u = static_cast<uint32_t>(rawIndex);
+    if (u < maxSlots) {
+        return rawIndex;
+    }
+    // If upper 16 bits were corrupted while preserving a valid low-16 slot (e.g. 0xB4800001 -> 1,
+    // 0xB4100000 -> 0), recover the original Ultimate Jutsu slot; otherwise fall back to slot 0
+    // (matching CC2's own ccSkillCustomizeParam +0x07015D7 clamping convention).
+    const uint32_t low16 = u & 0xFFFFU;
+    if ((u & 0xFFFF0000U) != 0U && low16 < maxSlots) {
+        return static_cast<int32_t>(low16);
+    }
+    return 0;
+}
+
+bool ValidateSpSkillParamTree(const void* pParamMgr) noexcept {
+    constexpr uintptr_t kMaxUserPtr = 0x00007FFFFFFF0000ULL;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(pParamMgr);
+    if (base < kMinValidPtr || base >= kMaxUserPtr || (base & 0x7ULL) != 0) {
+        return false;
+    }
+    __try {
+        const uintptr_t myHead = *reinterpret_cast<const uintptr_t*>(base + 0x30);
+        if (myHead < kMinValidPtr || myHead >= kMaxUserPtr || (myHead & 0x7ULL) != 0) {
+            return false;
+        }
+        if (*reinterpret_cast<const uint8_t*>(myHead + 0x19) != 1) {
+            return false;
+        }
+        const uintptr_t root = *reinterpret_cast<const uintptr_t*>(myHead + 0x08);
+        return (root >= kMinValidPtr && root < kMaxUserPtr && (root & 0x7ULL) == 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+inline int32_t SanitizeSpSkillIndex(
+    int32_t rawIndex, uint32_t maxSlots, int32_t charCode, const char* fnTag, uintptr_t callerAddr) noexcept {
+    if (static_cast<uint32_t>(rawIndex) < maxSlots) {
+        return rawIndex;
+    }
+    const int32_t safeIndex = RecoverSafeSpSkillIndex(rawIndex, maxSlots);
+    const uint64_t saveNum = g_Telemetry.spSkillOobSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (saveNum <= 16) {
+        LogNetcode("[CrashFix] Prevented 0xC0000005 in %s! Out-of-bounds spAtkIndex=0x%08X (%d) -> %d (max=%u, charCode=%d, caller=0x%llX).",
+                   fnTag,
+                   static_cast<uint32_t>(rawIndex),
+                   rawIndex,
+                   safeIndex,
+                   maxSlots,
+                   charCode,
+                   static_cast<unsigned long long>(callerAddr));
+    }
+    return safeIndex;
+}
+
+void SanitizeMainSavePreSetSpAtkIndices() noexcept {
+    if (!g_BaseAddress) {
+        return;
+    }
+    constexpr size_t kPresetCount  = 24;
+    constexpr size_t kPresetStride = 0x1C0;
+    constexpr size_t kCharCount    = 3;
+    constexpr size_t kCharStride   = 0x14;
+    constexpr size_t kSpAtkOffset  = 0x08;
+
+    auto* pPresetsBase = reinterpret_cast<uint8_t*>(g_BaseAddress + StormRva::kData_MainSavePreSetArray);
+    uint32_t sanitizedCount = 0;
+
+    __try {
+        for (size_t presetIdx = 0; presetIdx < kPresetCount; ++presetIdx) {
+            uint8_t* pPreset = pPresetsBase + presetIdx * kPresetStride;
+            for (size_t slotIdx = 0; slotIdx < kCharCount; ++slotIdx) {
+                uint8_t* pChar = pPreset + slotIdx * kCharStride;
+                const int32_t charId = *reinterpret_cast<const int32_t*>(pChar + 0x00);
+                auto* pSpAtkIdx = reinterpret_cast<int32_t*>(pChar + kSpAtkOffset);
+                const int32_t rawVal = *pSpAtkIdx;
+                if (static_cast<uint32_t>(rawVal) >= kMaxSpSkillMsgSlots) {
+                    const int32_t safeVal = RecoverSafeSpSkillIndex(rawVal, kMaxSpSkillMsgSlots);
+                    *pSpAtkIdx = safeVal;
+                    ++sanitizedCount;
+                    g_Telemetry.spSkillOobSaves.fetch_add(1, std::memory_order_relaxed);
+                    if (sanitizedCount <= 24) {
+                        LogNetcode("[CrashFix] Sanitized ccPreSetSaveData Preset[%zu].c%zu (charId=0x%X): spAtkIndex 0x%08X -> %d.",
+                                   presetIdx,
+                                   slotIdx,
+                                   static_cast<uint32_t>(charId),
+                                   static_cast<uint32_t>(rawVal),
+                                   safeVal);
+                    }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;
+    }
+
+    if (sanitizedCount > 0) {
+        LogNetcode("[CrashFix] Cleaned %u corrupted spAtkIndex slot(s) in ccPreSetSaveData prior to SaveData::SyncShadow.",
+                   sanitizedCount);
+    }
+}
+
 } // namespace
 
 const char* __fastcall hk_SteamGetFriendPersonaName(const uint64_t* pSteamId) {
@@ -644,14 +1250,209 @@ uint8_t __fastcall hk_KeyboardGetPressedChar(const void* pKeyMap) {
     if (!IsKeyboardKeyMapSafeToQuery(pKeyMap, "KeyboardGetPressedChar (+0x120FEE0)")) {
         return 0;
     }
-    return oKeyboardGetPressedChar ? oKeyboardGetPressedChar(pKeyMap) : 0;
+    uint8_t ch = oKeyboardGetPressedChar ? oKeyboardGetPressedChar(pKeyMap) : 0;
+    // In numeric-only mode (Session ID), vanilla's hardcoded US-QWERTY table (0x1413F58A0)
+    // maps Shift+top-row (AZERTY digit entry!) to '!'..')' and Shift+Numpad to '\0', which
+    // OnVirtualKeyboardFinish strips while still consuming m_maxLen (9) buffer slots until
+    // the input box silently locks up! Normalize any HID digit key directly to ASCII '0'..'9'.
+    if ((ch < '0' || ch > '9') && IsVirtualKeyboardNumericModeActiveSeh()) {
+        const uint32_t hidKey = oKeyboardGetPressedKey ? oKeyboardGetPressedKey(pKeyMap) : 0u;
+        const uint8_t  digit  = MapNumericHidKeyToAsciiDigit(hidKey);
+        if (digit != 0) {
+            ch = digit;
+        }
+    }
+    return ch;
 }
 
 uint32_t __fastcall hk_KeyboardGetPressedKey(const void* pKeyMap) {
+    if (reinterpret_cast<uintptr_t>(pKeyMap) == 0x60ULL) {
+        if (const void* recoveredKeyMap = TryRecoverVirtualKeyboardDeviceSeh()) {
+            if (IsKeyboardKeyMapSafeToQuery(recoveredKeyMap, "KeyboardGetPressedKey (+0x120FFB5)")) {
+                return oKeyboardGetPressedKey ? oKeyboardGetPressedKey(recoveredKeyMap) : 0;
+            }
+        }
+    }
     if (!IsKeyboardKeyMapSafeToQuery(pKeyMap, "KeyboardGetPressedKey (+0x120FFB5)")) {
         return 0;
     }
     return oKeyboardGetPressedKey ? oKeyboardGetPressedKey(pKeyMap) : 0;
+}
+
+// Fixes vanilla Use-After-Free crash @ NSUNSC.exe+0x00170878 (NSUNSC.exe.22936.dmp):
+// ~ccNetIdSearchState (+0x016FBB0) never closes ccVirtualKeyboard or clears [pVkImpl + 0xC0].
+// Detach the callback (and close the virtual keyboard if still active) BEFORE freeing `this`.
+void __fastcall hk_NetIdSearchStateDtor(void* pThis) {
+    void* pVkImpl = nullptr;
+    void* pCmd    = nullptr;
+    bool  wasOpen = false;
+    if (DetachVirtualKeyboardCallbackSeh(pThis, &pVkImpl, &pCmd, &wasOpen)) {
+        if (wasOpen) {
+            CloseVirtualKeyboardImplSeh(pVkImpl);
+            const uint64_t saveNum = g_Telemetry.virtualKeyboardNullSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+            LogNetcode("[CrashFix] Closed active ccVirtualKeyboard & detached callback in ~ccNetIdSearchState (+0x16FBB0) "
+                       "for pThis=0x%llX — prevented 0xC0000005 UAF @ +0x170878 (saves=%llu).",
+                       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pThis)),
+                       static_cast<unsigned long long>(saveNum));
+        }
+        DestroyDetachedSimpleCommandSeh(pVkImpl, pCmd);
+    }
+    if (oNetIdSearchDtor) {
+        oNetIdSearchDtor(pThis);
+    }
+}
+
+// Second-layer guard on ccNetIdSearchState::OnVirtualKeyboardFinish (+0x0170840 -> faults @ +0x0170878).
+void __fastcall hk_NetIdSearchStateOnVkFinish(void* pThis) {
+    const char* failReason = nullptr;
+    if (!ValidateNetIdSearchStateForVkFinishSeh(pThis, &failReason)) {
+        const uint64_t saveNum = g_Telemetry.virtualKeyboardNullSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+        LogNetcode("[CrashFix] Prevented 0xC0000005 UAF in ccNetIdSearchState::OnVirtualKeyboardFinish (+0x170878)! "
+                   "pThis=0x%llX (%s, saves=%llu).",
+                   static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pThis)),
+                   failReason ? failReason : "invalid state",
+                   static_cast<unsigned long long>(saveNum));
+        void* pVkImpl = nullptr;
+        void* pCmd    = nullptr;
+        bool  wasOpen = false;
+        if (DetachVirtualKeyboardCallbackSeh(pThis, &pVkImpl, &pCmd, &wasOpen)) {
+            DestroyDetachedSimpleCommandSeh(pVkImpl, pCmd);
+        }
+        return;
+    }
+    if (oNetIdSearchOnVkFinish) {
+        oNetIdSearchOnVkFinish(pThis);
+    }
+}
+
+namespace {
+
+bool PreCheckCommDestroySocketsSeh(void* pCommInner, uint64_t* outCookie, int32_t* outSockCount) noexcept {
+    *outCookie    = 0;
+    *outSockCount = 0;
+    if (reinterpret_cast<uintptr_t>(pCommInner) < kMinValidPtr) {
+        return false;
+    }
+    __try {
+        auto* pBytes = reinterpret_cast<uint8_t*>(pCommInner);
+        const uintptr_t pSockets = *reinterpret_cast<const uintptr_t*>(pBytes + 0x08);
+        const int32_t   sockCnt  = *reinterpret_cast<const int32_t*>(pBytes + 0x10);
+        const int32_t   isArray  = *reinterpret_cast<const int32_t*>(pBytes + 0x14);
+        if (isArray != 0 && pSockets >= kMinValidPtr && pSockets <= kMaxValidUserPtr) {
+            const uint64_t cookie = *reinterpret_cast<const uint64_t*>(pSockets - 8);
+            if (sockCnt <= 0 || sockCnt > 64 || cookie != static_cast<uint64_t>(sockCnt)) {
+                *reinterpret_cast<int32_t*>(pBytes + 0x14) = 0; // Force scalar delete (edx=1)
+                *outCookie    = cookie;
+                *outSockCount = sockCnt;
+                return true;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return false;
+}
+
+void PostResetCommDestroySocketsSeh(void* pCommInner) noexcept {
+    if (reinterpret_cast<uintptr_t>(pCommInner) < kMinValidPtr) {
+        return;
+    }
+    __try {
+        auto* pBytes = reinterpret_cast<uint8_t*>(pCommInner);
+        *reinterpret_cast<int32_t*>(pBytes + 0x10) = 0;
+        *reinterpret_cast<int32_t*>(pBytes + 0x14) = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+bool TryTriggerSelfDisconnectOnMemberLeftSeh(void* pSession, uint64_t leavingSteamId) noexcept {
+    if (reinterpret_cast<uintptr_t>(pSession) < kMinValidPtr || !IsValidSteamId(leavingSteamId)) {
+        return false;
+    }
+    __try {
+        auto* pSessBytes = reinterpret_cast<uint8_t*>(pSession);
+        const uintptr_t pMySlot = *reinterpret_cast<const uintptr_t*>(pSessBytes + 0x500);
+        if (pMySlot < kMinValidPtr || pMySlot > kMaxValidUserPtr) {
+            return false;
+        }
+        const uint64_t mySteamId = *reinterpret_cast<const uint64_t*>(pMySlot + 0x38);
+        if (IsValidSteamId(mySteamId) && mySteamId == leavingSteamId) {
+            // Exact mirror of ccNetSession::DisconnectSelf (0x0113BC20)
+            if (*reinterpret_cast<const int32_t*>(pSessBytes + 0x530) == 0) {
+                *reinterpret_cast<int32_t*>(pSessBytes + 0x530) = 1;
+                *reinterpret_cast<int32_t*>(pSessBytes + 0x538) = 0x1E;
+            }
+            return true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return false;
+}
+
+bool CheckAndCloseZeroMemberZombieSessionSeh(void* pSession) noexcept {
+    if (reinterpret_cast<uintptr_t>(pSession) < kMinValidPtr) {
+        return false;
+    }
+    __try {
+        auto* pSessBytes = reinterpret_cast<uint8_t*>(pSession);
+        const int32_t memberCount = *reinterpret_cast<const int32_t*>(pSessBytes + 0x1B0);
+        if (memberCount <= 0 && *reinterpret_cast<const int32_t*>(pSessBytes + 0x530) == 0) {
+            *reinterpret_cast<int32_t*>(pSessBytes + 0x530) = 1;
+            *reinterpret_cast<int32_t*>(pSessBytes + 0x538) = 0x1E;
+            return true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return false;
+}
+
+} // namespace
+
+// Fixes vanilla new vs delete[] mismatch crash @ NSUNSC.exe+0x0117116C (NSUNSC.exe.15168.dmp):
+// ConnectToHost (+0x01169480 / +0x01169500) allocates a scalar `new ccNetSessionTCPSocketBase`
+// (0x10 bytes, no 8-byte array count cookie) after DestroySockets (+0x01168E20) WITHOUT clearing
+// m_isArray (+0x14 = 1 left over from an earlier Host new[] allocation). On teardown, delete[]
+// reads the NUCC heap allocator header at [m_pSockets - 8] (e.g. 0x23 = 35!) and walks OOB!
+void __fastcall hk_SessionCommDestroySockets(void* pCommInner) {
+    if (!oSessionCommDestroySockets) {
+        return;
+    }
+    uint64_t badCookie = 0;
+    int32_t  sockCnt   = 0;
+    if (PreCheckCommDestroySocketsSeh(pCommInner, &badCookie, &sockCnt)) {
+        const uint64_t saveNum = g_Telemetry.sessionDisconnectNullSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+        LogNetcode("[CrashFix] Prevented 0xC0000005 new/delete[] mismatch in Comm::DestroySockets (+0x1168E20 -> +0x117116C)! "
+                   "pCommInner=0x%llX sockCount=%d badCookie=0x%llX -> forced scalar delete (saves=%llu).",
+                   static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pCommInner)),
+                   sockCnt,
+                   static_cast<unsigned long long>(badCookie),
+                   static_cast<unsigned long long>(saveNum));
+    }
+    oSessionCommDestroySockets(pCommInner);
+    PostResetCommDestroySocketsSeh(pCommInner);
+}
+
+// Fixes vanilla 0-member "zombie lobby" (4 empty dark-grey cards) in Custom/Endless lobbies:
+// Steam callback OnSteamLobbyChatUpdate (+0x0113DE70) jumps directly to OnMemberLeft (+0x0113D1E0)
+// WITHOUT checking `leavingSteamId == m_pMySlot->steamId` (unlike +0x116DDD1 & +0x116EE80!).
+// When Steam drops the local Host, OnMemberLeft zeroes m_slots[0], drops memberCount to 0, and
+// skips DisconnectSelf (+0x0113BC20) because host migration (+0x16C) is enabled.
+void __fastcall hk_SessionOnMemberLeft(void* pSession, uint64_t leavingSteamId) {
+    if (TryTriggerSelfDisconnectOnMemberLeftSeh(pSession, leavingSteamId)) {
+        const uint64_t saveNum = g_Telemetry.sessionDisconnectNullSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+        LogNetcode("[LobbyFix] Prevented zombie 0-member lobby in ccNetSession::OnMemberLeft (+0x113D1E0)! "
+                   "Steam dropped local SteamID 0x%llX -> triggered clean DisconnectSelf (saves=%llu).",
+                   static_cast<unsigned long long>(leavingSteamId),
+                   static_cast<unsigned long long>(saveNum));
+        return;
+    }
+    if (oSessionOnMemberLeft) {
+        oSessionOnMemberLeft(pSession, leavingSteamId);
+    }
+    if (CheckAndCloseZeroMemberZombieSessionSeh(pSession)) {
+        const uint64_t saveNum = g_Telemetry.sessionDisconnectNullSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+        LogNetcode("[LobbyFix] Closed empty 0-member zombie session after ccNetSession::OnMemberLeft (+0x113D1E0) (saves=%llu).",
+                   static_cast<unsigned long long>(saveNum));
+    }
 }
 
 // Guards ccNetSessionCommunicator::SendPacket (0x141169290, faults @ +0x11692A3 in 14496.dmp)
@@ -659,8 +1460,15 @@ uint32_t __fastcall hk_KeyboardGetPressedKey(const void* pKeyMap) {
 int32_t __fastcall hk_SessionCommSendPacket(void* pComm, void* pPacket, uint32_t packetSize, int32_t targetUId) {
     const uintptr_t commAddr = reinterpret_cast<uintptr_t>(pComm);
     const uintptr_t pktAddr  = reinterpret_cast<uintptr_t>(pPacket);
-    if (commAddr < kMinValidPtr || pktAddr < kMinValidPtr ||
-        *reinterpret_cast<const uintptr_t*>(commAddr + 0x08) < kMinValidPtr) {
+    uintptr_t innerComm      = 0;
+    if (commAddr >= kMinValidPtr && pktAddr >= kMinValidPtr) {
+        __try {
+            innerComm = *reinterpret_cast<const uintptr_t*>(commAddr + 0x08);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            innerComm = 0;
+        }
+    }
+    if (innerComm < kMinValidPtr) {
         const uint64_t saveNum = g_Telemetry.sessionDisconnectNullSaves.fetch_add(1, std::memory_order_relaxed) + 1;
         if (saveNum <= 16) {
             LogNetcode("[CrashFix] Prevented 0xC0000005 in SessionComm::SendPacket (+0x11692A3)! pComm=0x%llX pPacket=0x%llX targetUId=%d (abrupt disconnect).",
@@ -678,8 +1486,15 @@ int32_t __fastcall hk_SessionCommSendPacket(void* pComm, void* pPacket, uint32_t
 int32_t __fastcall hk_SessionCommBroadcastPacket(void* pComm, void* pPacket, uint32_t packetSize, int32_t excludeUId) {
     const uintptr_t commAddr = reinterpret_cast<uintptr_t>(pComm);
     const uintptr_t pktAddr  = reinterpret_cast<uintptr_t>(pPacket);
-    if (commAddr < kMinValidPtr || pktAddr < kMinValidPtr ||
-        *reinterpret_cast<const uintptr_t*>(commAddr + 0x08) < kMinValidPtr) {
+    uintptr_t innerComm      = 0;
+    if (commAddr >= kMinValidPtr && pktAddr >= kMinValidPtr) {
+        __try {
+            innerComm = *reinterpret_cast<const uintptr_t*>(commAddr + 0x08);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            innerComm = 0;
+        }
+    }
+    if (innerComm < kMinValidPtr) {
         const uint64_t saveNum = g_Telemetry.sessionDisconnectNullSaves.fetch_add(1, std::memory_order_relaxed) + 1;
         if (saveNum <= 16) {
             LogNetcode("[CrashFix] Prevented 0xC0000005 in SessionComm::BroadcastPacket (+0x1169320)! pComm=0x%llX pPacket=0x%llX excludeUId=%d (abrupt disconnect).",
@@ -711,17 +1526,21 @@ void* __fastcall hk_SessionGetMySlot(void* pSessionHolder) {
     void* pSlot = nullptr;
 
     if (holderAddr >= kMinValidPtr) {
-        const uintptr_t sessionAddr = *reinterpret_cast<const uintptr_t*>(holderAddr + 0x20);
-        if (sessionAddr >= kMinValidPtr) {
-            auto* pSession = reinterpret_cast<uint8_t*>(sessionAddr);
-            pSlot = *reinterpret_cast<void**>(pSession + 0x500);
-            if (reinterpret_cast<uintptr_t>(pSlot) >= kMinValidPtr) {
-                const uint64_t sid = *reinterpret_cast<const uint64_t*>(reinterpret_cast<const uint8_t*>(pSlot) + 0x38);
-                if (IsValidSteamId(sid)) {
-                    s_LastKnownLocalSteamId.store(sid, std::memory_order_relaxed);
+        __try {
+            const uintptr_t sessionAddr = *reinterpret_cast<const uintptr_t*>(holderAddr + 0x20);
+            if (sessionAddr >= kMinValidPtr) {
+                auto* pSession = reinterpret_cast<uint8_t*>(sessionAddr);
+                pSlot = *reinterpret_cast<void**>(pSession + 0x500);
+                if (reinterpret_cast<uintptr_t>(pSlot) >= kMinValidPtr) {
+                    const uint64_t sid = *reinterpret_cast<const uint64_t*>(reinterpret_cast<const uint8_t*>(pSlot) + 0x38);
+                    if (IsValidSteamId(sid)) {
+                        s_LastKnownLocalSteamId.store(sid, std::memory_order_relaxed);
+                    }
+                    return pSlot;
                 }
-                return pSlot;
+                pSlot = nullptr;
             }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
             pSlot = nullptr;
         }
     }
@@ -776,6 +1595,8 @@ void __fastcall hk_SessionSortSlotsAndRefreshMySlot(void* pSession) {
             return;
         }
     }
+
+    SanitizeSessionMemberSlots(pSessBytes, true, "Session::SortSlots");
 
     __try {
         oSessionSortSlots(pSession);
@@ -843,6 +1664,8 @@ void __fastcall hk_SessionProcessReceivedMessages(void* pSession) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_Telemetry.sessionDisconnectNullSaves.fetch_add(1, std::memory_order_relaxed);
     }
+
+    SanitizeSessionMemberSlots(pSessBytes, true, "Session::ProcessMessages");
 
     if (usedDummySlot && *reinterpret_cast<void**>(pSessBytes + 0x500) == s_SafeDummySessionSlot) {
         *reinterpret_cast<void**>(pSessBytes + 0x500) = nullptr;
@@ -960,18 +1783,21 @@ void __fastcall hk_SessionInvokeCallback(void* pSession, int32_t callbackId, voi
     }
 
     if (callbackId == 0) {
-        if (s_LastAssignedMemberWasDuplicate.exchange(false, std::memory_order_relaxed)) {
-            return; // Do not fire a duplicate OnMemberJoined event for an already-joined member!
+        const bool     wasDuplicate = s_LastAssignedMemberWasDuplicate.exchange(false, std::memory_order_relaxed);
+        const uint64_t expectedSid  = s_LastAssignedMemberSteamId.exchange(0ULL, std::memory_order_relaxed);
+        const int32_t  expectedUId  = s_LastAssignedMemberUId.exchange(0, std::memory_order_relaxed);
+
+        // If pSlot is NULL (e.g. lobby full 8/8 -> 0x14116EACF skipped AssignNextUId) or duplicate, abort immediately
+        // before attempting slot re-resolution so a prior player's SteamID can never hijack a NULL callback.
+        if (wasDuplicate || reinterpret_cast<uintptr_t>(pSlot) < kMinValidPtr) {
+            return;
         }
 
         auto* pSessBytes = reinterpret_cast<uint8_t*>(pSession);
         uint8_t* const slotsBase = pSessBytes + 0x2C0;
-        const uint64_t expectedSid = s_LastAssignedMemberSteamId.load(std::memory_order_relaxed);
-        const int32_t  expectedUId = s_LastAssignedMemberUId.load(std::memory_order_relaxed);
 
         if (IsValidSteamId(expectedSid)) {
             const bool slotMatches =
-                reinterpret_cast<uintptr_t>(pSlot) >= kMinValidPtr &&
                 *reinterpret_cast<const uint64_t*>(reinterpret_cast<const uint8_t*>(pSlot) + 0x38) == expectedSid;
             if (!slotMatches) {
                 for (int i = 0; i < 8; ++i) {
@@ -994,114 +1820,328 @@ void __fastcall hk_SessionInvokeCallback(void* pSession, int32_t callbackId, voi
     oSessionInvokeCallback(pSession, callbackId, pSlot);
 }
 
+// Fixes State1_Update existing-member handler (0x14113C8B0):
+// Vanilla returns 1 (skipping AddMemberToTable + duplicate OnMemberJoined callback) when SteamID matches m_slots[0..7],
+// EXCEPT it unconditionally overwrites `slot->uId = newMemberEntry->uId` at +0x113C99C even when slot already has
+// an active uId (>= 10), desyncing BattleTable vs m_slots. Preserve the existing valid uId when non-colliding.
+int32_t __fastcall hk_SessionCheckExistingNewMember(void* pSession, void* pNewMemberEntry) {
+    if (!oSessionCheckNewMember) {
+        return 0;
+    }
+    auto* pSessBytes  = reinterpret_cast<uint8_t*>(pSession);
+    auto* pEntryBytes = reinterpret_cast<const uint8_t*>(pNewMemberEntry);
+    int32_t matchedIdx = -1;
+    int32_t savedUId   = -1;
+    uint64_t entrySid  = 0ULL;
+
+    if (reinterpret_cast<uintptr_t>(pSessBytes) >= kMinValidPtr &&
+        reinterpret_cast<uintptr_t>(pEntryBytes) >= kMinValidPtr) {
+        __try {
+            entrySid = *reinterpret_cast<const uint64_t*>(pEntryBytes + 0x28);
+            if (IsValidSteamId(entrySid)) {
+                const uint8_t* slotsBase = pSessBytes + 0x2C0;
+                for (int32_t i = 0; i < 8; ++i) {
+                    const uint8_t* slotI = slotsBase + static_cast<size_t>(i) * 0x48;
+                    if (*reinterpret_cast<const uint64_t*>(slotI + 0x38) == entrySid) {
+                        const int32_t uidI = *reinterpret_cast<const int32_t*>(slotI + 0x40);
+                        if (uidI >= 10) {
+                            matchedIdx = i;
+                            savedUId   = uidI;
+                        }
+                        break;
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            matchedIdx = -1;
+        }
+    }
+
+    const int32_t result = oSessionCheckNewMember(pSession, pNewMemberEntry);
+
+    if (result != 0 && matchedIdx >= 0 && savedUId >= 10) {
+        __try {
+            uint8_t* const slotsBase = pSessBytes + 0x2C0;
+            uint8_t* const slotM     = slotsBase + static_cast<size_t>(matchedIdx) * 0x48;
+            if (*reinterpret_cast<const uint64_t*>(slotM + 0x38) == entrySid &&
+                *reinterpret_cast<const int32_t*>(slotM + 0x40) != savedUId) {
+                bool collides = false;
+                for (int32_t i = 0; i < 8; ++i) {
+                    if (i == matchedIdx) continue;
+                    const uint8_t* slotI = slotsBase + static_cast<size_t>(i) * 0x48;
+                    if (IsValidSteamId(*reinterpret_cast<const uint64_t*>(slotI + 0x38)) &&
+                        *reinterpret_cast<const int32_t*>(slotI + 0x40) == savedUId) {
+                        collides = true;
+                        break;
+                    }
+                }
+                if (!collides) {
+                    const int32_t overwrittenUId = *reinterpret_cast<int32_t*>(slotM + 0x40);
+                    *reinterpret_cast<int32_t*>(slotM + 0x40) = savedUId;
+                    if (*reinterpret_cast<int32_t*>(pSessBytes + 0x168) < savedUId) {
+                        *reinterpret_cast<int32_t*>(pSessBytes + 0x168) = savedUId;
+                    }
+                    const uint64_t saveNum = g_Telemetry.duplicateLobbySlotSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (saveNum <= 16) {
+                        LogNetcode("[LobbyFix] Preserved slot[%d].uId=%d (blocked stale NewMember uId=%d) for SteamID 0x%llX!",
+                                   matchedIdx, savedUId, overwrittenUId, static_cast<unsigned long long>(entrySid));
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    return result;
+}
+
+// Guards NewMemberTbl::Add (0x141169E20, called only with pSession + 0x520 from ProcessMessages / RecvNewMember):
+// Prevents duplicate queued entries for the same SteamID and ignores redundant NewMember arrivals for already-slotted peers.
+uint8_t __fastcall hk_SessionNewMemberTblAdd(void* pNewMemberContainer, uint64_t memberSteamId, const void* pMeta, int32_t uId) {
+    if (!oSessionNewMemberTblAdd) {
+        return 0;
+    }
+    if (reinterpret_cast<uintptr_t>(pNewMemberContainer) >= kMinValidPtr && IsValidSteamId(memberSteamId)) {
+        bool suppress = false;
+        __try {
+            auto* pCont = reinterpret_cast<uint8_t*>(pNewMemberContainer);
+            uint8_t* inner = *reinterpret_cast<uint8_t**>(pCont + 0x08);
+            if (reinterpret_cast<uintptr_t>(inner) >= kMinValidPtr) {
+                uint8_t* sentinel = *reinterpret_cast<uint8_t**>(inner + 0x20);
+                if (reinterpret_cast<uintptr_t>(sentinel) >= kMinValidPtr) {
+                    uint8_t* node = *reinterpret_cast<uint8_t**>(sentinel);
+                    for (int hops = 0; hops < 32 && reinterpret_cast<uintptr_t>(node) >= kMinValidPtr && node != sentinel; ++hops) {
+                        uint8_t* elem = node + 0x10;
+                        if (*reinterpret_cast<const uint64_t*>(elem + 0x28) == memberSteamId) {
+                            auto* queuedUId = reinterpret_cast<int32_t*>(elem + 0x24);
+                            if (uId > 0 && *queuedUId <= 0) {
+                                *queuedUId = uId;
+                            }
+                            suppress = true;
+                            break;
+                        }
+                        node = *reinterpret_cast<uint8_t**>(node);
+                    }
+                }
+            }
+
+            if (!suppress) {
+                // `pNewMemberContainer` is `pSession + 0x520` at both verified callers (+0x116DDC7 & +0x116EF75)
+                uint8_t* pSessBytes = pCont - 0x520;
+                const uint8_t* slotsBase = pSessBytes + 0x2C0;
+                const uint8_t* mySlot    = *reinterpret_cast<const uint8_t* const*>(pSessBytes + 0x500);
+                for (int32_t i = 0; i < 8; ++i) {
+                    const uint8_t* slotI = slotsBase + static_cast<size_t>(i) * 0x48;
+                    if (*reinterpret_cast<const uint64_t*>(slotI + 0x38) != memberSteamId) {
+                        continue;
+                    }
+                    const int32_t existingUId = *reinterpret_cast<const int32_t*>(slotI + 0x40);
+                    if (existingUId >= 10 && (existingUId == uId || slotI == mySlot)) {
+                        suppress = true;
+                        const uint64_t saveNum = g_Telemetry.duplicateLobbySlotSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (saveNum <= 16) {
+                            LogNetcode("[LobbyFix] Suppressed redundant NewMemberTbl::Add for SteamID 0x%llX (already in slot %d, uId=%d)",
+                                       static_cast<unsigned long long>(memberSteamId), i, existingUId);
+                        }
+                    }
+                    break;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            suppress = false;
+        }
+        if (suppress) {
+            return 1;
+        }
+    }
+    return oSessionNewMemberTblAdd(pNewMemberContainer, memberSteamId, pMeta, uId);
+}
+
 // Fixes UpdateBattleTableFromChangeQueue (0x1400F4310):
-// At +0x00F4439..+0x00F4479, vanilla handles `status == 6` (initial join) by searching BattleTable[0..7]
-// ONLY for `uId <= -1` (first empty slot) without checking whether `uId` is already present in BattleTable!
-// Whenever a player's status==6 entry is queued more than once, vanilla inserts a second copy of the same uId.
+// At +0x00F4439..+0x00F4479 (Loop 1, status == 6) and +0x00F4750..+0x00F4847 (Loop 3, remaining statuses),
+// vanilla searches BattleTable[0..7] ONLY for empty slots without checking whether uId (or SteamID) is already present.
 void __fastcall hk_CustomLobbyUpdateBattleTable(void* pLobbyState) {
     if (!oCustomLobbyUpdateBattleTbl || reinterpret_cast<uintptr_t>(pLobbyState) < kMinValidPtr || !g_BaseAddress) {
         return;
     }
 
-    uint8_t* pBattleTable = nullptr;
-    int32_t  maxMembers   = 8;
-    const uintptr_t pNetMgr = *reinterpret_cast<const uintptr_t*>(g_BaseAddress + StormRva::kGlobalNetManagerPtr);
-    if (pNetMgr >= kMinValidPtr) {
-        const uintptr_t pLocalInfo = *reinterpret_cast<const uintptr_t*>(pNetMgr + 0x100);
-        const uintptr_t pSessData  = *reinterpret_cast<const uintptr_t*>(pNetMgr + 0xF8);
-        if (pLocalInfo >= kMinValidPtr) {
-            pBattleTable = reinterpret_cast<uint8_t*>(pLocalInfo + 0xC8);
+    uint8_t* pBattleTable  = nullptr;
+    uint8_t* pSessionData  = nullptr;
+    const uint8_t* pSlots  = nullptr;
+    __try {
+        const uintptr_t pNetMgr = *reinterpret_cast<const uintptr_t*>(g_BaseAddress + StormRva::kGlobalNetManagerPtr);
+        if (pNetMgr >= kMinValidPtr) {
+            const uintptr_t pLocalInfo = *reinterpret_cast<const uintptr_t*>(pNetMgr + 0x100);
+            const uintptr_t pSessData  = *reinterpret_cast<const uintptr_t*>(pNetMgr + 0xF8);
+            if (pLocalInfo >= kMinValidPtr) {
+                pBattleTable = reinterpret_cast<uint8_t*>(pLocalInfo + 0xC8);
+            }
+            if (pSessData >= kMinValidPtr) {
+                // Verified at NSUNSC.exe+0x00F43A0..+0x00F43C6 & +0x10F39B0..+0x10F39EA:
+                // [pNetMgr + 0xF8] is ccNetSessionData* (+0x28=m_maxMember, +0x2C=m_memberCount, +0x13C=m_slots[8]),
+                // NOT ccNetSession* (which embeds ccNetSessionData at +0x184 -> m_slots at +0x2C0).
+                pSessionData = reinterpret_cast<uint8_t*>(pSessData);
+                pSlots       = pSessionData + 0x13C;
+            }
         }
-        if (pSessData >= kMinValidPtr) {
-            maxMembers = std::clamp(*reinterpret_cast<const int32_t*>(pSessData + 0x28), 1, 8);
-        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 
     if (pBattleTable) {
-        // 1. Deduplicate any existing duplicate rows in BattleTable[0..maxMembers-1]
-        DeduplicateCustomLobbyBattleTable(pBattleTable, maxMembers, "Pre-UpdateBattleTable");
+        // 1. Deduplicate BEFORE scrubbing m_slots so distinct uIds sharing a SteamID are caught immediately
+        DeduplicateCustomLobbyBattleTable(pBattleTable, 8, pSlots, "Pre-UpdateBattleTable", false);
+    }
+
+    if (pSessionData) {
+        SanitizeSessionMemberSlots(pSessionData, false, "Pre-UpdateBattleTable");
+    }
+
+    if (pBattleTable) {
+        // 1b. Wipe any scrubbed/orphan uId rows left in BattleTable
+        DeduplicateCustomLobbyBattleTable(pBattleTable, 8, pSlots, "Pre-UpdateBattleTable", true);
 
         // 2. Sanitize m_changeQueue ([pLobbyState + 0x448] .. [pLobbyState + 0x450], stride 0x258)
-        auto* pLobbyBytes = reinterpret_cast<uint8_t*>(pLobbyState);
-        uint8_t* qBegin   = *reinterpret_cast<uint8_t**>(pLobbyBytes + 0x448);
-        uint8_t* qEnd     = *reinterpret_cast<uint8_t**>(pLobbyBytes + 0x450);
-        if (reinterpret_cast<uintptr_t>(qBegin) >= kMinValidPtr && qEnd > qBegin &&
-            ((qEnd - qBegin) % 0x258) == 0 && ((qEnd - qBegin) / 0x258) <= 64) {
-            const size_t qCount = static_cast<size_t>((qEnd - qBegin) / 0x258);
-            for (size_t qi = 0; qi < qCount; ++qi) {
-                uint8_t* qEntry       = qBegin + qi * 0x258;
-                const int32_t qUId    = *reinterpret_cast<const int32_t*>(qEntry + 0x00);
-                const int32_t qStatus = *reinterpret_cast<const int32_t*>(qEntry + 0x04);
-                if (qUId < 0 || qStatus != 6) {
-                    continue;
-                }
-
-                // Check if qUId is already present in BattleTable[0..maxMembers-1]
-                int32_t existingBtIdx = -1;
-                for (int32_t bi = 0; bi < maxMembers; ++bi) {
-                    const uint8_t* btEntry = pBattleTable + static_cast<size_t>(bi) * 0x258;
-                    if (*reinterpret_cast<const int32_t*>(btEntry + 0x00) == qUId &&
-                        *reinterpret_cast<const int32_t*>(btEntry + 0x04) >= 0) {
-                        existingBtIdx = bi;
-                        break;
+        __try {
+            auto* pLobbyBytes = reinterpret_cast<uint8_t*>(pLobbyState);
+            uint8_t* qBegin   = *reinterpret_cast<uint8_t**>(pLobbyBytes + 0x448);
+            uint8_t* qEnd     = *reinterpret_cast<uint8_t**>(pLobbyBytes + 0x450);
+            if (reinterpret_cast<uintptr_t>(qBegin) >= kMinValidPtr && qEnd > qBegin &&
+                ((qEnd - qBegin) % 0x258) == 0 && ((qEnd - qBegin) / 0x258) <= 64) {
+                const size_t qCount = static_cast<size_t>((qEnd - qBegin) / 0x258);
+                for (size_t qi = 0; qi < qCount; ++qi) {
+                    uint8_t* qEntry       = qBegin + qi * 0x258;
+                    const int32_t qUId    = *reinterpret_cast<const int32_t*>(qEntry + 0x00);
+                    const int32_t qStatus = *reinterpret_cast<const int32_t*>(qEntry + 0x04);
+                    if (qUId < 0 || qStatus < 0) {
+                        continue;
                     }
-                }
 
-                if (existingBtIdx >= 0) {
-                    // Already in BattleTable! Convert status 6 -> existing status (or 5=waiting) if needed,
-                    // or drop redundant initial-join so +0x00F4450 never allocates a second slot for qUId!
-                    *reinterpret_cast<int32_t*>(qEntry + 0x00) = -1;
-                    *reinterpret_cast<int32_t*>(qEntry + 0x04) = -1;
-                    const uint64_t saveNum = g_Telemetry.duplicateLobbySlotSaves.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (saveNum <= 16) {
-                        LogNetcode("[LobbyFix] Suppressed duplicate status=6 changeQueue insertion for uId=%d (already in BattleTable[%d])",
-                                   qUId, existingBtIdx);
+                    if (qStatus == 6) {
+                        const uint64_t qSid = FindSlotSteamIdByUId(pSlots, qUId);
+                        int32_t existingBtIdx = -1;
+                        for (int32_t bi = 0; bi < 8; ++bi) {
+                            const uint8_t* btEntry = pBattleTable + static_cast<size_t>(bi) * 0x258;
+                            const int32_t btUId    = *reinterpret_cast<const int32_t*>(btEntry + 0x00);
+                            const int32_t btStatus = *reinterpret_cast<const int32_t*>(btEntry + 0x04);
+                            if (btUId < 0 || btStatus < 0) {
+                                continue;
+                            }
+                            if (btUId == qUId ||
+                                (IsValidSteamId(qSid) && FindSlotSteamIdByUId(pSlots, btUId) == qSid)) {
+                                existingBtIdx = bi;
+                                break;
+                            }
+                        }
+
+                        if (existingBtIdx >= 0) {
+                            *reinterpret_cast<int32_t*>(qEntry + 0x00) = -1;
+                            *reinterpret_cast<int32_t*>(qEntry + 0x04) = -1;
+                            const uint64_t saveNum = g_Telemetry.duplicateLobbySlotSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if (saveNum <= 16) {
+                                LogNetcode("[LobbyFix] Suppressed duplicate status=6 changeQueue insertion for uId=%d (already in BattleTable[%d])",
+                                           qUId, existingBtIdx);
+                            }
+                            continue;
+                        }
                     }
-                    continue;
-                }
 
-                // Also suppress duplicate status==6 entries for the same qUId within the same changeQueue batch
-                for (size_t qj = qi + 1; qj < qCount; ++qj) {
-                    uint8_t* qNext = qBegin + qj * 0x258;
-                    if (*reinterpret_cast<const int32_t*>(qNext + 0x00) == qUId &&
-                        *reinterpret_cast<const int32_t*>(qNext + 0x04) == 6) {
-                        *reinterpret_cast<int32_t*>(qNext + 0x00) = -1;
-                        *reinterpret_cast<int32_t*>(qNext + 0x04) = -1;
-                        g_Telemetry.duplicateLobbySlotSaves.fetch_add(1, std::memory_order_relaxed);
+                    // Suppress duplicate (qUId, qStatus) entries in the same changeQueue batch (protects Loop 1 & Loop 3)
+                    for (size_t qj = qi + 1; qj < qCount; ++qj) {
+                        uint8_t* qNext = qBegin + qj * 0x258;
+                        if (*reinterpret_cast<const int32_t*>(qNext + 0x00) == qUId &&
+                            *reinterpret_cast<const int32_t*>(qNext + 0x04) == qStatus) {
+                            *reinterpret_cast<int32_t*>(qNext + 0x00) = -1;
+                            *reinterpret_cast<int32_t*>(qNext + 0x04) = -1;
+                            g_Telemetry.duplicateLobbySlotSaves.fetch_add(1, std::memory_order_relaxed);
+                        }
                     }
                 }
             }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
     }
 
     oCustomLobbyUpdateBattleTbl(pLobbyState);
 
     if (pBattleTable) {
-        DeduplicateCustomLobbyBattleTable(pBattleTable, maxMembers, "Post-UpdateBattleTable");
+        DeduplicateCustomLobbyBattleTable(pBattleTable, 8, pSlots, "Post-UpdateBattleTable", true);
     }
 }
 
-// Guards ccStateMachineCustomMatchLobbyUi::UpdateUserList (0x1400FF810) so duplicate uId rows
-// can never be rendered in the Custom/Private Lobby UI list.
+// Guards CustomLobby::BattleTable_ReceiveCallback (0x1400F6F30):
+// Sanitizes m_slots & deduplicates LocalInfo->BattleTable[0..7] right after SetBattleTable (0x1406C39E0)
+// so duplicate rows sent by an unmodded Host are cleared immediately on arrival.
+void __fastcall hk_CustomLobbyRecvBattleTable(void* pLobbyState, void* pArg2, const void* pPacket) {
+    if (!oCustomLobbyRecvBattleTbl) {
+        return;
+    }
+
+    uint8_t* pBattleTable = nullptr;
+    uint8_t* pSessionData = nullptr;
+    const uint8_t* pSlots = nullptr;
+    if (g_BaseAddress) {
+        __try {
+            const uintptr_t pNetMgr = *reinterpret_cast<const uintptr_t*>(g_BaseAddress + StormRva::kGlobalNetManagerPtr);
+            if (pNetMgr >= kMinValidPtr) {
+                const uintptr_t pLocalInfo = *reinterpret_cast<const uintptr_t*>(pNetMgr + 0x100);
+                const uintptr_t pSessData  = *reinterpret_cast<const uintptr_t*>(pNetMgr + 0xF8);
+                if (pLocalInfo >= kMinValidPtr) {
+                    pBattleTable = reinterpret_cast<uint8_t*>(pLocalInfo + 0xC8);
+                }
+                if (pSessData >= kMinValidPtr) {
+                    // [pNetMgr + 0xF8] is ccNetSessionData* (m_slots[8] at +0x13C, NOT ccNetSession* +0x2C0).
+                    pSessionData = reinterpret_cast<uint8_t*>(pSessData);
+                    pSlots       = pSessionData + 0x13C;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+
+    if (pBattleTable) {
+        DeduplicateCustomLobbyBattleTable(pBattleTable, 8, pSlots, "Pre-RecvBattleTable", false);
+    }
+    if (pSessionData) {
+        SanitizeSessionMemberSlots(pSessionData, false, "Pre-RecvBattleTable");
+    }
+
+    oCustomLobbyRecvBattleTbl(pLobbyState, pArg2, pPacket);
+
+    if (pBattleTable) {
+        DeduplicateCustomLobbyBattleTable(pBattleTable, 8, pSlots, "Post-RecvBattleTable", true);
+    }
+}
+
+// Guards ccStateMachineCustomMatchLobbyUi::UpdateUserList (0x1400FF810) so duplicate uId/SteamID rows
+// and orphan uId ghost cards can never be rendered in the Custom/Endless Lobby UI list.
 // Note: 0x00FF810 takes 6 arguments (rcx=pLobbyUi, rdx=pSessionData, r8=pBattleTable, r9=pArg4,
 // [rsp+0x28]=selectedIdx, [rsp+0x30]=pArg6); all 6 must be forwarded intact!
 void __fastcall hk_CustomLobbyUiUpdateUserList(
     void* pLobbyUi, void* pSessionData, void* pBattleTable, void* pArg4, uint64_t selectedIdx, void* pArg6) {
-    if (reinterpret_cast<uintptr_t>(pBattleTable) >= kMinValidPtr &&
-        reinterpret_cast<uintptr_t>(pSessionData) >= kMinValidPtr) {
-        int32_t maxMembers = 8;
-        __try {
-            maxMembers = std::clamp(
-                *reinterpret_cast<const int32_t*>(reinterpret_cast<const uint8_t*>(pSessionData) + 0x28),
-                1, 8);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            maxMembers = 8;
-        }
-        if (maxMembers > 1) {
-            DeduplicateCustomLobbyBattleTable(reinterpret_cast<uint8_t*>(pBattleTable),
-                                              maxMembers,
-                                              "CustomLobbyUi::UpdateUserList(0x00FF810)");
-        }
+    const uint8_t* pSlots = nullptr;
+    auto* pDataBytes = (reinterpret_cast<uintptr_t>(pSessionData) >= kMinValidPtr)
+        ? reinterpret_cast<uint8_t*>(pSessionData)
+        : nullptr;
+    if (pDataBytes) {
+        pSlots = pDataBytes + 0x13C;
+    }
+    if (reinterpret_cast<uintptr_t>(pBattleTable) >= kMinValidPtr) {
+        // Deduplicate BEFORE scrubbing m_slots so distinct uIds sharing a SteamID still match
+        DeduplicateCustomLobbyBattleTable(reinterpret_cast<uint8_t*>(pBattleTable),
+                                          8,
+                                          pSlots,
+                                          "CustomLobbyUi::UpdateUserList(pre)",
+                                          false);
+    }
+    if (pDataBytes) {
+        SanitizeSessionMemberSlots(pDataBytes, false, "CustomLobbyUi::UpdateUserList");
+    }
+    if (reinterpret_cast<uintptr_t>(pBattleTable) >= kMinValidPtr) {
+        // Prune scrubbed/stale orphan uIds so UpdateUserList (0x00FF9E5) wipes frozen ghost cards cleanly!
+        DeduplicateCustomLobbyBattleTable(reinterpret_cast<uint8_t*>(pBattleTable),
+                                          8,
+                                          pSlots,
+                                          "CustomLobbyUi::UpdateUserList(0x00FF810)",
+                                          true);
     }
     if (oCustomLobbyUiUpdateUsers) {
         __try {
@@ -1212,6 +2252,81 @@ void __fastcall hk_ChatTemplateClearDynamic(void* pManager) {
     }
 }
 
+float __fastcall hk_SpSkillGetFloatParam1(void* pParamMgr, int32_t charCode, int32_t spAtkIndex) {
+    if (!oSpSkillGetFloatParam1 || !ValidateSpSkillParamTree(pParamMgr)) {
+        return 0.0f;
+    }
+    const int32_t safeIdx = SanitizeSpSkillIndex(
+        spAtkIndex, kMaxSpSkillFloatSlots, charCode, "SpSkillCustomize::GetFloatParam1 (+0x070225B)", reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    __try {
+        return oSpSkillGetFloatParam1(pParamMgr, charCode, safeIdx);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_Telemetry.spSkillOobSaves.fetch_add(1, std::memory_order_relaxed);
+        return 0.0f;
+    }
+}
+
+float __fastcall hk_SpSkillGetFloatParam2(void* pParamMgr, int32_t charCode, int32_t spAtkIndex) {
+    if (!oSpSkillGetFloatParam2 || !ValidateSpSkillParamTree(pParamMgr)) {
+        return 0.0f;
+    }
+    const int32_t safeIdx = SanitizeSpSkillIndex(
+        spAtkIndex, kMaxSpSkillFloatSlots, charCode, "SpSkillCustomize::GetFloatParam2 (+0x07022AB)", reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    __try {
+        return oSpSkillGetFloatParam2(pParamMgr, charCode, safeIdx);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_Telemetry.spSkillOobSaves.fetch_add(1, std::memory_order_relaxed);
+        return 0.0f;
+    }
+}
+
+const char* __fastcall hk_SpSkillGetMsgIdPtr(void* pParamMgr, int32_t charCode, int32_t spAtkIndex) {
+    if (!oSpSkillGetMsgIdPtr || !ValidateSpSkillParamTree(pParamMgr)) {
+        return nullptr;
+    }
+    const int32_t safeIdx = SanitizeSpSkillIndex(
+        spAtkIndex, kMaxSpSkillMsgSlots, charCode, "SpSkillCustomize::GetMsgIdPtr (+0x07022FE)", reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    __try {
+        return oSpSkillGetMsgIdPtr(pParamMgr, charCode, safeIdx);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_Telemetry.spSkillOobSaves.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+}
+
+uint32_t __fastcall hk_SpSkillGetDwordParam(void* pParamMgr, int32_t charCode, int32_t spAtkIndex) {
+    if (!oSpSkillGetDwordParam || !ValidateSpSkillParamTree(pParamMgr)) {
+        return 0U;
+    }
+    const int32_t safeIdx = SanitizeSpSkillIndex(
+        spAtkIndex, kMaxSpSkillMsgSlots, charCode, "SpSkillCustomize::GetDwordParam (+0x0702352)", reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    __try {
+        return oSpSkillGetDwordParam(pParamMgr, charCode, safeIdx);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_Telemetry.spSkillOobSaves.fetch_add(1, std::memory_order_relaxed);
+        return 0U;
+    }
+}
+
+int32_t __fastcall hk_SpSkillGetMessageId(void* pParamMgr, int32_t charCode, int32_t spAtkIndex, void* pOutNuccString) {
+    if (!oSpSkillGetMessageId || !pOutNuccString || !ValidateSpSkillParamTree(pParamMgr)) {
+        return 0;
+    }
+    const int32_t safeIdx = SanitizeSpSkillIndex(
+        spAtkIndex, kMaxSpSkillMsgSlots, charCode, "SpSkillCustomize::GetMessageId (+0x0702447)", reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    __try {
+        return oSpSkillGetMessageId(pParamMgr, charCode, safeIdx, pOutNuccString);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_Telemetry.spSkillOobSaves.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+}
+
+void* __fastcall hk_SaveDataSyncShadow() {
+    SanitizeMainSavePreSetSpAtkIndices();
+    return oSaveDataSyncShadow ? oSaveDataSyncShadow() : nullptr;
+}
+
 void ApplyCrashAndNetcodeBytePatches(bool applyCrashPatches, bool applyNetcodePatches) noexcept {
     if (applyCrashPatches || applyNetcodePatches) {
         ApplyVerifiedBytePatch(g_EnginePatches[0]); // PushResendRequest null-deref fix
@@ -1221,6 +2336,7 @@ void ApplyCrashAndNetcodeBytePatches(bool applyCrashPatches, bool applyNetcodePa
         ApplyVerifiedBytePatch(g_EnginePatches[7]); // ccStateChatWindow exit2 teardown order fix (+0x016A8CB)
         ApplyVerifiedBytePatch(g_EnginePatches[8]); // ccStateChatWindow exit3 teardown order fix (+0x016AAE1)
         InstallLobbySlotNullFixBridge();            // LobbySlotNullFix bridge (+0x113D7E6) & State1SortFix (+0x113D736)
+        InstallVfxCoordNullFixBridges();            // VFX m_pCoord TOCTOU null-deref guards (+0x132C99B + 6 twins)
     }
     if (applyNetcodePatches) {
         ApplyVerifiedBytePatch(g_EnginePatches[2]); // ReceivePackets multi-record lookahead fix
@@ -1258,12 +2374,19 @@ bool InstallLobbySlotNullFixBridge() {
 
     if (!s_pLobbySlotTrampoline) {
         s_pLobbySlotTrampoline = reinterpret_cast<uint8_t*>(VirtualAlloc(
-            nullptr, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+            nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
         if (!s_pLobbySlotTrampoline) {
             LogNetcode("[ERROR] VirtualAlloc failed for LobbySlotNullFix trampoline!");
             return false;
         }
+    } else {
+        DWORD rwProt = 0;
+        if (!VirtualProtect(s_pLobbySlotTrampoline, 0x1000, PAGE_READWRITE, &rwProt)) {
+            LogNetcode("[ERROR] VirtualProtect(RW) failed for LobbySlotNullFix trampoline!");
+            return false;
+        }
     }
+    std::memset(s_pLobbySlotTrampoline, 0xCC, 128);
 
     const uintptr_t vaNotifyPeer  = g_BaseAddress + StormRva::kLobby_NotifyPeer;
     const uintptr_t vaReturnAddr  = g_BaseAddress + StormRva::kLobby_State1_Next;
@@ -1291,13 +2414,15 @@ bool InstallLobbySlotNullFixBridge() {
     *p++ = 0xEB; *p++ = 0x1A;
 
     // 0x23: slot_null:
-    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x28;
+    // Entered via JMP from 0x14113D7E6 where RSP % 16 == 0; subtract 0x20 (32B shadow space)
+    // so RSP remains 16-byte aligned before `call rax` (strict Windows x64 ABI compliance).
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x20;
     *p++ = 0x48; *p++ = 0x89; *p++ = 0xF1;
     *p++ = 0x48; *p++ = 0x89; *p++ = 0xEA;
     *p++ = 0x48; *p++ = 0xB8;
     std::memcpy(p, &vaNullHandler, 8); p += 8;
     *p++ = 0xFF; *p++ = 0xD0;
-    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x28;
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x20;
 
     // 0x3D: done:
     *p++ = 0x48; *p++ = 0xB8;
@@ -1305,6 +2430,13 @@ bool InstallLobbySlotNullFixBridge() {
     *p++ = 0xFF; *p++ = 0xE0;
 
     const size_t stubLen = static_cast<size_t>(p - s_pLobbySlotTrampoline);
+    DWORD rxProt = 0;
+    if (!VirtualProtect(s_pLobbySlotTrampoline, 0x1000, PAGE_EXECUTE_READ, &rxProt)) {
+        LogNetcode("[ERROR] VirtualProtect(RX) failed for LobbySlotNullFix trampoline!");
+        VirtualFree(s_pLobbySlotTrampoline, 0, MEM_RELEASE);
+        s_pLobbySlotTrampoline = nullptr;
+        return false;
+    }
     FlushInstructionCache(GetCurrentProcess(), s_pLobbySlotTrampoline, stubLen);
 
     uint8_t bridgeBytes[21];
@@ -1390,6 +2522,634 @@ void RemoveLobbySlotNullFixBridge() noexcept {
         VirtualFree(s_pLobbySlotTrampoline, 0, MEM_RELEASE);
         s_pLobbySlotTrampoline = nullptr;
     }
+}
+
+// ============================================================================
+// VFX nuccCoord TOCTOU Null-Deref Bridges (fixes 0xC0000005 @ +0x0132C99B + 6 twins)
+// In nuccTrailForceField::Update (+0x0132C830 -> +0x0132C99B in NSUNSC.exe.19008.dmp)
+// and 6 identical VFX forcefield/particle sites, the game tests `m_pCoord != NULL`,
+// calls `m_pCoord->UpdateWorldMatrix()` (`call [rax+0x28]`), then reloads `m_pCoord`
+// from memory WITHOUT re-checking NULL before `movzx ..., byte ptr [reg + 0x120]`.
+// When nuccTrailBase::Detach (+0x01328210 -> DetachCoord +0x0132CEE0) zeroes m_pCoord
+// concurrently on another thread, the worker reads [0 + 0x120] -> 0xC0000005.
+// Solution: 2-page W^X near-2GB trampoline (Page 0 = RX stubs, Page 1 = RW atomic
+// counters) with 5-byte `jmp rel32` detours checking `cmp reg, 0x10000; jb nullSkip`.
+// ============================================================================
+
+namespace {
+
+struct VfxCoordGuardSite {
+    const char* name;
+    uintptr_t   patchRva;
+    uintptr_t   resumeRva;
+    uintptr_t   nullSkipRva;
+    bool        checkRdx; // false = check RCX, true = check RDX
+    uint8_t     reloadLen;
+    uint8_t     reloadBytes[8];
+    uint8_t     derefLen;
+    uint8_t     derefBytes[16];
+    bool        applied;
+};
+
+VfxCoordGuardSite g_VfxCoordSites[] = {
+    // 0) nuccTrailForceField::Update (+0x0132C997, faults @ +0x0132C99B in NSUNSC.exe.19008.dmp)
+    {
+        "nuccTrailForceField::Update (+0x132C99B)",
+        0x0132C997, 0x0132C9A2, 0x0132C9E5, false,
+        4, { 0x49, 0x8B, 0x4F, 0x28 },
+        7, { 0x0F, 0xB6, 0x81, 0x20, 0x01, 0x00, 0x00 },
+        false
+    },
+    // 1) VFX m_pCoord Twin #1 (+0x0131C6CD -> +0x0131C6D0)
+    {
+        "VfxCoordGuard Twin1 (+0x131C6D0)",
+        0x0131C6CD, 0x0131C6D7, 0x0131C84B, false,
+        3, { 0x48, 0x8B, 0x0B },
+        7, { 0x0F, 0xB6, 0x81, 0x20, 0x01, 0x00, 0x00 },
+        false
+    },
+    // 2) VFX m_pCoord Twin #2 (+0x0131C990 -> +0x0131C993; nullSkip -> +0x0131C9C5 restores xmm1..xmm3!)
+    {
+        "VfxCoordGuard Twin2 (+0x131C993)",
+        0x0131C990, 0x0131C99A, 0x0131C9C5, false,
+        3, { 0x48, 0x8B, 0x0B },
+        7, { 0x0F, 0xB6, 0x81, 0x20, 0x01, 0x00, 0x00 },
+        false
+    },
+    // 3) VFX m_pCoord Twin #3 (+0x0131CD7A -> +0x0131CD7D)
+    {
+        "VfxCoordGuard Twin3 (+0x131CD7D)",
+        0x0131CD7A, 0x0131CD84, 0x0131CDCC, false,
+        3, { 0x48, 0x8B, 0x0E },
+        7, { 0x0F, 0xB6, 0x99, 0x20, 0x01, 0x00, 0x00 },
+        false
+    },
+    // 4) VFX m_pCoord Twin #4 (+0x01385040 -> +0x01385048)
+    {
+        "VfxCoordGuard Twin4 (+0x1385048)",
+        0x01385040, 0x0138504F, 0x01385090, false,
+        4, { 0x48, 0x8B, 0x4B, 0x40 },
+        11, { 0x48, 0x8D, 0x55, 0xB7, 0x0F, 0xB6, 0xB9, 0x20, 0x01, 0x00, 0x00 },
+        false
+    },
+    // 5) VFX m_pCoord Twin #5 (+0x01387B5C -> +0x01387B60)
+    {
+        "VfxCoordGuard Twin5 (+0x1387B60)",
+        0x01387B5C, 0x01387B67, 0x01387B91, true,
+        4, { 0x48, 0x8B, 0x53, 0x40 },
+        7, { 0x0F, 0xB6, 0x8A, 0x20, 0x01, 0x00, 0x00 },
+        false
+    },
+    // 6) VFX m_pCoord Twin #6 (+0x01387BDB -> +0x01387BDE)
+    {
+        "VfxCoordGuard Twin6 (+0x1387BDE)",
+        0x01387BDB, 0x01387BE5, 0x01387C09, true,
+        3, { 0x48, 0x8B, 0x13 },
+        7, { 0x0F, 0xB6, 0x8A, 0x20, 0x01, 0x00, 0x00 },
+        false
+    },
+};
+
+uint8_t*  s_pVfxCoordTrampoline = nullptr; // 2 pages: [0..0xFFF] = RX code, [0x1000..0x1FFF] = RW counters
+uint64_t* s_pVfxCoordCounters   = nullptr;
+
+uint8_t* AllocateNear2GbTwoPages(uintptr_t anchorVa) noexcept {
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    const uintptr_t gran    = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000ULL;
+    const uintptr_t sysMin  = reinterpret_cast<uintptr_t>(si.lpMinimumApplicationAddress);
+    const uintptr_t sysMax  = reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress);
+    constexpr uintptr_t kMaxSpan = 0x60000000ULL; // ±1.5 GB keeps every rel32 well inside ±2 GB
+    const uintptr_t minAddr = (anchorVa > sysMin + kMaxSpan) ? (anchorVa - kMaxSpan) : sysMin;
+    const uintptr_t maxAddr = (anchorVa + kMaxSpan < sysMax) ? (anchorVa + kMaxSpan) : sysMax;
+
+    auto tryAllocRange = [gran](uintptr_t start, uintptr_t end, bool downward) -> uint8_t* {
+        if (!downward) {
+            uintptr_t addr = (start + gran - 1) & ~(gran - 1);
+            while (addr + 0x2000ULL <= end) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0) {
+                    break;
+                }
+                const uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                const uintptr_t regionEnd  = regionBase + mbi.RegionSize;
+                if (mbi.State == MEM_FREE) {
+                    const uintptr_t aligned = (addr + gran - 1) & ~(gran - 1);
+                    if (aligned + 0x2000ULL <= regionEnd && aligned + 0x2000ULL <= end) {
+                        void* p = VirtualAlloc(reinterpret_cast<LPVOID>(aligned), 0x2000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                        if (p) return reinterpret_cast<uint8_t*>(p);
+                    }
+                }
+                if (regionEnd <= addr) break;
+                addr = (regionEnd + gran - 1) & ~(gran - 1);
+            }
+        } else {
+            uintptr_t addr = end & ~(gran - 1);
+            while (addr >= start + gran) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0) {
+                    break;
+                }
+                const uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                if (mbi.State == MEM_FREE && mbi.RegionSize >= 0x2000ULL) {
+                    const uintptr_t aligned = (std::min(addr, regionBase + mbi.RegionSize - 0x2000ULL)) & ~(gran - 1);
+                    if (aligned >= regionBase && aligned >= start) {
+                        void* p = VirtualAlloc(reinterpret_cast<LPVOID>(aligned), 0x2000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                        if (p) return reinterpret_cast<uint8_t*>(p);
+                    }
+                }
+                if (regionBase < start + gran) break;
+                addr = (regionBase - gran) & ~(gran - 1);
+            }
+        }
+        return nullptr;
+    };
+
+    if (uint8_t* p = tryAllocRange(anchorVa, maxAddr, false)) return p;
+    return tryAllocRange(minAddr, anchorVa, true);
+}
+
+bool FitsRel32(uintptr_t srcNextVa, uintptr_t dstVa, int32_t* outRel) noexcept {
+    const int64_t diff = static_cast<int64_t>(dstVa) - static_cast<int64_t>(srcNextVa);
+    if (diff < INT32_MIN || diff > INT32_MAX) {
+        return false;
+    }
+    *outRel = static_cast<int32_t>(diff);
+    return true;
+}
+
+} // namespace
+
+bool InstallVfxCoordNullFixBridges() {
+    if (!g_BaseAddress) return false;
+    if (s_pVfxCoordTrampoline) return true;
+
+    s_pVfxCoordTrampoline = AllocateNear2GbTwoPages(g_BaseAddress + 0x0132C997ULL);
+    if (!s_pVfxCoordTrampoline) {
+        LogNetcode("[ERROR] Failed to allocate near-2GB trampoline pages for VfxCoordNullFix!");
+        return false;
+    }
+    std::memset(s_pVfxCoordTrampoline, 0xCC, 0x1000);
+    std::memset(s_pVfxCoordTrampoline + 0x1000, 0x00, 0x1000);
+    s_pVfxCoordCounters = reinterpret_cast<uint64_t*>(s_pVfxCoordTrampoline + 0x1000);
+
+    // Emit all 7 stubs on Page 0 first, verify every byte & rel32 before flipping to RX
+    uint8_t* stubCursor = s_pVfxCoordTrampoline;
+    uintptr_t stubVas[std::size(g_VfxCoordSites)] = {};
+    bool siteReady[std::size(g_VfxCoordSites)]    = {};
+
+    for (size_t i = 0; i < std::size(g_VfxCoordSites); ++i) {
+        auto& site = g_VfxCoordSites[i];
+        const size_t totalLen = static_cast<size_t>(site.reloadLen) + static_cast<size_t>(site.derefLen);
+        const auto* targetPtr = reinterpret_cast<const uint8_t*>(g_BaseAddress + site.patchRva);
+        if (std::memcmp(targetPtr, site.reloadBytes, site.reloadLen) != 0 ||
+            std::memcmp(targetPtr + site.reloadLen, site.derefBytes, site.derefLen) != 0) {
+            LogNetcode("[WARN] Byte mismatch for %s @ RVA 0x%llX; skipping.",
+                       site.name, static_cast<unsigned long long>(site.patchRva));
+            continue;
+        }
+
+        // Align each stub to 16 bytes on Page 0
+        const uintptr_t alignedAddr = (reinterpret_cast<uintptr_t>(stubCursor) + 15ULL) & ~15ULL;
+        uint8_t* p = reinterpret_cast<uint8_t*>(alignedAddr);
+        const uintptr_t stubVa     = alignedAddr;
+        const uintptr_t resumeVa   = g_BaseAddress + site.resumeRva;
+        const uintptr_t nullSkipVa = g_BaseAddress + site.nullSkipRva;
+        const uintptr_t counterVa  = reinterpret_cast<uintptr_t>(&s_pVfxCoordCounters[i]);
+
+        int32_t relToStub = 0;
+        if (!FitsRel32(g_BaseAddress + site.patchRva + 5ULL, stubVa, &relToStub)) {
+            LogNetcode("[WARN] Rel32 out of range for %s; skipping.", site.name);
+            continue;
+        }
+
+        // 1. Original reload instruction (e.g. `mov rcx, [r15 + 0x28]`)
+        std::memcpy(p, site.reloadBytes, site.reloadLen); p += site.reloadLen;
+        // 2. `cmp rcx/rdx, 0x10000` (catches NULL and invalid low pointers with 0 GPR clobbers)
+        *p++ = 0x48; *p++ = 0x81; *p++ = site.checkRdx ? 0xFA : 0xF9;
+        *p++ = 0x00; *p++ = 0x00; *p++ = 0x01; *p++ = 0x00;
+        // 3. `jb null_path` (skips derefBytes + 5-byte jmp resume)
+        *p++ = 0x72; *p++ = static_cast<uint8_t>(site.derefLen + 5u);
+        // 4. Original deref bytes (e.g. `movzx eax, byte ptr [rcx + 0x120]`)
+        std::memcpy(p, site.derefBytes, site.derefLen); p += site.derefLen;
+        // 5. `jmp rel32 resumeVa`
+        int32_t relResume = 0;
+        if (!FitsRel32(reinterpret_cast<uintptr_t>(p) + 5ULL, resumeVa, &relResume)) {
+            continue;
+        }
+        *p++ = 0xE9;
+        std::memcpy(p, &relResume, 4); p += 4;
+        // 6. null_path: `lock inc qword ptr [rip + disp32]` (8 bytes, 0 GPR clobbers)
+        int32_t dispCounter = 0;
+        if (!FitsRel32(reinterpret_cast<uintptr_t>(p) + 8ULL, counterVa, &dispCounter)) {
+            continue;
+        }
+        *p++ = 0xF0; *p++ = 0x48; *p++ = 0xFF; *p++ = 0x05;
+        std::memcpy(p, &dispCounter, 4); p += 4;
+        // 7. `jmp rel32 nullSkipVa`
+        int32_t relNullSkip = 0;
+        if (!FitsRel32(reinterpret_cast<uintptr_t>(p) + 5ULL, nullSkipVa, &relNullSkip)) {
+            continue;
+        }
+        *p++ = 0xE9;
+        std::memcpy(p, &relNullSkip, 4); p += 4;
+
+        stubCursor   = p;
+        stubVas[i]   = stubVa;
+        siteReady[i] = true;
+        (void)totalLen;
+    }
+
+    // Strict W^X: switch Page 0 to PAGE_EXECUTE_READ before patching live code
+    DWORD rxOldProt = 0;
+    if (!VirtualProtect(s_pVfxCoordTrampoline, 0x1000, PAGE_EXECUTE_READ, &rxOldProt)) {
+        LogNetcode("[ERROR] VirtualProtect(RX) failed for VfxCoordNullFix trampoline!");
+        VirtualFree(s_pVfxCoordTrampoline, 0, MEM_RELEASE);
+        s_pVfxCoordTrampoline = nullptr;
+        s_pVfxCoordCounters   = nullptr;
+        return false;
+    }
+    FlushInstructionCache(GetCurrentProcess(), s_pVfxCoordTrampoline, 0x1000);
+
+    int appliedCount = 0;
+    for (size_t i = 0; i < std::size(g_VfxCoordSites); ++i) {
+        if (!siteReady[i]) continue;
+        auto& site = g_VfxCoordSites[i];
+        const size_t totalLen = static_cast<size_t>(site.reloadLen) + static_cast<size_t>(site.derefLen);
+        auto* targetPtr = reinterpret_cast<uint8_t*>(g_BaseAddress + site.patchRva);
+
+        int32_t relToStub = 0;
+        if (!FitsRel32(g_BaseAddress + site.patchRva + 5ULL, stubVas[i], &relToStub)) {
+            continue;
+        }
+
+        uint8_t patchBuf[24];
+        patchBuf[0] = 0xE9;
+        std::memcpy(&patchBuf[1], &relToStub, 4);
+        for (size_t b = 5; b < totalLen; ++b) {
+            patchBuf[b] = 0x90;
+        }
+
+        DWORD oldProt = 0;
+        if (VirtualProtect(targetPtr, totalLen, PAGE_EXECUTE_READWRITE, &oldProt)) {
+            std::memcpy(targetPtr, patchBuf, totalLen);
+            FlushInstructionCache(GetCurrentProcess(), targetPtr, totalLen);
+            DWORD dummyProt = 0;
+            VirtualProtect(targetPtr, totalLen, oldProt, &dummyProt);
+            site.applied = true;
+            ++appliedCount;
+        }
+    }
+
+    LogNetcode("[Patch] Applied  VfxCoordNullFix Bridges (%d/%zu TOCTOU sites guarded: +0x132C99B + 6 twins -> RX 0x%llX)",
+               appliedCount, std::size(g_VfxCoordSites),
+               static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(s_pVfxCoordTrampoline)));
+    return appliedCount > 0;
+}
+
+void RemoveVfxCoordNullFixBridges() noexcept {
+    if (!g_BaseAddress) return;
+    for (auto& site : g_VfxCoordSites) {
+        if (!site.applied) continue;
+        const size_t totalLen = static_cast<size_t>(site.reloadLen) + static_cast<size_t>(site.derefLen);
+        auto* targetPtr = reinterpret_cast<uint8_t*>(g_BaseAddress + site.patchRva);
+        DWORD oldProt = 0;
+        if (VirtualProtect(targetPtr, totalLen, PAGE_EXECUTE_READWRITE, &oldProt)) {
+            std::memcpy(targetPtr, site.reloadBytes, site.reloadLen);
+            std::memcpy(targetPtr + site.reloadLen, site.derefBytes, site.derefLen);
+            FlushInstructionCache(GetCurrentProcess(), targetPtr, totalLen);
+            DWORD dummyProt = 0;
+            VirtualProtect(targetPtr, totalLen, oldProt, &dummyProt);
+        }
+        site.applied = false;
+    }
+    if (s_pVfxCoordTrampoline) {
+        VirtualFree(s_pVfxCoordTrampoline, 0, MEM_RELEASE);
+        s_pVfxCoordTrampoline = nullptr;
+        s_pVfxCoordCounters   = nullptr;
+    }
+}
+
+uint64_t GetVfxCoordNullSaves() noexcept {
+    if (!s_pVfxCoordCounters) return 0;
+    uint64_t sum = 0;
+    for (size_t i = 0; i < std::size(g_VfxCoordSites); ++i) {
+        sum += reinterpret_cast<const volatile uint64_t*>(s_pVfxCoordCounters)[i];
+    }
+    return sum;
+}
+
+// ============================================================================
+// ccTaskManager Iterator-Invalidation UAF, Parallel Lock & ccTask::Exec Armor
+// Fixes 0xC0000005 @ NSUNSC.exe+0x0109C8E0 (`cmp dword ptr [rcx + 0x20], 0`):
+//   1) UpdateRange (+0x10D6A6C) advances `mov rbx, [rbx]` AFTER `call ccTask::Exec`,
+//      while RemoveTask (+0x10D7060) immediately zeroes `[node]` and frees `node`.
+//   2) AddTask (+0x10D6200) & RemoveTask (+0x10D6FE0) never lock `[pMgr + 0x1470]`
+//      (`nuccCriticalSection`), racing against parallel workers in ExecParallelTask
+//      (+0x10D6640) and invalidating `m_pParallelIterNode` (`[pMgr + 0x14C8]`).
+// Solution:
+//   - Synchronize AddTask/RemoveTask/DeleteAllTasks with `[pMgr + 0x1470]`.
+//   - While UpdateRange / UpdateSingleParallel / m_bParallelActive is active,
+//     RemoveTask replaces `node->pTask` with a per-priority static tombstone whose
+//     `m_bActive` (+0x20) == 0 (skipped in 2 cycles by ccTask::Exec) WITHOUT freeing
+//     the list node, then reaps dirty buckets natively via oTaskMgrRemoveTask once
+//     iteration exits (0 leaks, handles self-removal & sibling-removal & ABA cleanly).
+//   - Guard ccTask::Exec (+0x109C8E0) against NULL / dangling task or vtable ptrs.
+// ============================================================================
+
+namespace {
+
+struct alignas(16) TombstoneTask {
+    uintptr_t vtable;     // +0x00
+    uint8_t   pad08[16];  // +0x08..+0x17
+    uint32_t  priority;   // +0x18 (read by vanilla RemoveTask at +0x10D7004)
+    uint32_t  pauseBits;  // +0x1C
+    int32_t   activeFlag; // +0x20 (0 -> ccTask::Exec skips immediately)
+    uint32_t  pad24;      // +0x24
+    uint64_t  pad28;      // +0x28..+0x2F (explicit 16-byte alignment multiple = 0x30)
+};
+static_assert(sizeof(TombstoneTask) == 0x30, "TombstoneTask size mismatch");
+static_assert(offsetof(TombstoneTask, priority) == 0x18, "TombstoneTask::priority offset mismatch");
+static_assert(offsetof(TombstoneTask, activeFlag) == 0x20, "TombstoneTask::activeFlag offset mismatch");
+
+void* __fastcall TombstoneNoOpScalarDtor(void* pThis, uint32_t) noexcept {
+    return pThis;
+}
+
+void __fastcall TombstoneNoOpVirtual(void*) noexcept {}
+
+const uintptr_t kSafeTombstoneVtable[8] = {
+    reinterpret_cast<uintptr_t>(&TombstoneNoOpScalarDtor),
+    reinterpret_cast<uintptr_t>(&TombstoneNoOpVirtual),
+    reinterpret_cast<uintptr_t>(&TombstoneNoOpVirtual),
+    reinterpret_cast<uintptr_t>(&TombstoneNoOpVirtual),
+    reinterpret_cast<uintptr_t>(&TombstoneNoOpVirtual),
+    reinterpret_cast<uintptr_t>(&TombstoneNoOpVirtual),
+    reinterpret_cast<uintptr_t>(&TombstoneNoOpVirtual),
+    reinterpret_cast<uintptr_t>(&TombstoneNoOpVirtual),
+};
+
+TombstoneTask         s_TombstoneTasks[128]    = {};
+std::atomic<int32_t>  s_TaskMgrUpdateDepth{0};
+std::atomic<int32_t>  s_TaskMgrActiveDeferrals{0};
+std::atomic<void*>    s_LastTombstonedMgr{nullptr};
+std::atomic<uint64_t> s_TaskMgrDirtyMask[2]    = {};
+std::atomic<uint64_t> s_TaskMgrDeferredCount{0};
+
+bool TryLockTaskMgrCs(void* pMgr) noexcept {
+    if (!g_fnNuccCsLock || !g_fnNuccCsUnlock || reinterpret_cast<uintptr_t>(pMgr) < kMinValidPtr) {
+        return false;
+    }
+    auto* pBytes = reinterpret_cast<uint8_t*>(pMgr);
+    if (*reinterpret_cast<const int32_t*>(pBytes + 0x1498) == 0) {
+        return false; // nuccCriticalSection (+0x1470) not initialized yet
+    }
+    g_fnNuccCsLock(pBytes + 0x1470);
+    return true;
+}
+
+void UnlockTaskMgrCs(void* pMgr, bool locked) noexcept {
+    if (locked && g_fnNuccCsUnlock && reinterpret_cast<uintptr_t>(pMgr) >= kMinValidPtr) {
+        g_fnNuccCsUnlock(reinterpret_cast<uint8_t*>(pMgr) + 0x1470);
+    }
+}
+
+void ReapTombstonedTaskNodesLocked(void* pMgr) noexcept {
+    if (!oTaskMgrRemoveTask || reinterpret_cast<uintptr_t>(pMgr) < kMinValidPtr) {
+        return;
+    }
+    void* const ownerMgr = s_LastTombstonedMgr.load(std::memory_order_acquire);
+    if (ownerMgr != nullptr && ownerMgr != pMgr) {
+        return;
+    }
+    const uint64_t mask0 = s_TaskMgrDirtyMask[0].exchange(0ULL, std::memory_order_acq_rel);
+    const uint64_t mask1 = s_TaskMgrDirtyMask[1].exchange(0ULL, std::memory_order_acq_rel);
+    if ((mask0 | mask1) == 0ULL) {
+        return;
+    }
+
+    auto reapWord = [&](uint64_t bits, uint32_t basePrio) noexcept {
+        unsigned long bitIdx = 0;
+        while (_BitScanForward64(&bitIdx, bits)) {
+            bits &= (bits - 1ULL);
+            const uint32_t prio = basePrio + static_cast<uint32_t>(bitIdx);
+            oTaskMgrRemoveTask(pMgr, &s_TombstoneTasks[prio]);
+        }
+    };
+    reapWord(mask0, 0u);
+    reapWord(mask1, 64u);
+}
+
+void ReapTombstonedTaskNodes(void* pMgr) noexcept {
+    // Dekker-ordered wait: if a concurrent RemoveTask observed s_TaskMgrUpdateDepth > 0 just before
+    // our fetch_sub(1), let it finish setting s_TaskMgrDirtyMask (~50ns) so we reap on this exact frame.
+    while (s_TaskMgrActiveDeferrals.load(std::memory_order_seq_cst) > 0) {
+        _mm_pause();
+    }
+    if ((s_TaskMgrDirtyMask[0].load(std::memory_order_acquire) |
+         s_TaskMgrDirtyMask[1].load(std::memory_order_acquire)) == 0ULL) {
+        return;
+    }
+    void* const ownerMgr = s_LastTombstonedMgr.load(std::memory_order_acquire);
+    if (ownerMgr != nullptr && ownerMgr != pMgr) {
+        return;
+    }
+    const bool locked = TryLockTaskMgrCs(pMgr);
+    ReapTombstonedTaskNodesLocked(pMgr);
+    UnlockTaskMgrCs(pMgr, locked);
+}
+
+bool TombstoneTaskInBucketSeh(void* pMgr, void* pTask, uint32_t prio) noexcept {
+    bool tombstoned = false;
+    __try {
+        auto* pMgrBytes  = reinterpret_cast<uint8_t*>(pMgr);
+        uint8_t* pHead   = *reinterpret_cast<uint8_t**>(pMgrBytes + static_cast<size_t>(prio) * 0x28 + 0x30);
+        if (reinterpret_cast<uintptr_t>(pHead) >= kMinValidPtr) {
+            uint8_t* node = *reinterpret_cast<uint8_t**>(pHead + 0x00);
+            for (uint32_t guard = 0;
+                 guard < 65536u && reinterpret_cast<uintptr_t>(node) >= kMinValidPtr && node != pHead;
+                 ++guard) {
+                uint8_t* nextNode = *reinterpret_cast<uint8_t**>(node + 0x00);
+                if (*reinterpret_cast<void**>(node + 0x10) == pTask) {
+                    *reinterpret_cast<void**>(node + 0x10) = &s_TombstoneTasks[prio];
+                    tombstoned = true;
+                }
+                node = nextNode;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_Telemetry.taskManagerCrashSaves.fetch_add(1, std::memory_order_relaxed);
+    }
+    return tombstoned;
+}
+
+bool ReadTaskExecTargetSeh(void* pTask, uint32_t pauseMask, uintptr_t* outFn, bool* outFaulted) noexcept {
+    *outFn      = 0;
+    *outFaulted = false;
+    __try {
+        const auto* pBytes = reinterpret_cast<const uint8_t*>(pTask);
+        if (*reinterpret_cast<const int32_t*>(pBytes + 0x20) == 0) {
+            return false; // Inactive task or deferred tombstone
+        }
+        if ((*reinterpret_cast<const uint32_t*>(pBytes + 0x1C) & pauseMask) != 0u) {
+            return false; // Task paused by current pause mask
+        }
+        const uintptr_t vtbl = *reinterpret_cast<const uintptr_t*>(pBytes + 0x00);
+        if (vtbl < kMinValidPtr) {
+            *outFaulted = true;
+            return false;
+        }
+        const uintptr_t fn = *reinterpret_cast<const uintptr_t*>(vtbl + 0x18);
+        if (fn < kMinValidPtr) {
+            *outFaulted = true;
+            return false;
+        }
+        *outFn = fn;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outFaulted = true;
+        return false;
+    }
+}
+
+bool ReadTaskPrioritySeh(void* pTask, uint32_t* outPrio) noexcept {
+    *outPrio = 0xFFFFFFFFu;
+    __try {
+        *outPrio = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(pTask) + 0x18);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+} // namespace
+
+void InitTaskManagerTombstones() noexcept {
+    for (uint32_t i = 0; i < 128u; ++i) {
+        s_TombstoneTasks[i].vtable     = reinterpret_cast<uintptr_t>(kSafeTombstoneVtable);
+        std::memset(s_TombstoneTasks[i].pad08, 0, sizeof(s_TombstoneTasks[i].pad08));
+        s_TombstoneTasks[i].priority   = i;
+        s_TombstoneTasks[i].pauseBits  = 0;
+        s_TombstoneTasks[i].activeFlag = 0;
+        s_TombstoneTasks[i].pad24      = 0;
+    }
+}
+
+void __fastcall hk_TaskExec(void* pTask, uint32_t pauseMask) {
+    const uintptr_t taskAddr = reinterpret_cast<uintptr_t>(pTask);
+    if (taskAddr < kMinValidPtr) {
+        const uint64_t saveNum = g_Telemetry.taskManagerCrashSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (saveNum <= 16) {
+            LogNetcode("[CrashFix] Prevented 0xC0000005 in ccTask::Exec (+0x0109C8E0)! Invalid pTask=0x%llX pauseMask=0x%X",
+                       static_cast<unsigned long long>(taskAddr), pauseMask);
+        }
+        return;
+    }
+
+    uintptr_t execFn  = 0;
+    bool      faulted = false;
+    if (ReadTaskExecTargetSeh(pTask, pauseMask, &execFn, &faulted)) {
+        reinterpret_cast<void(__fastcall*)(void*, uint32_t)>(execFn)(pTask, pauseMask);
+        return;
+    }
+
+    if (faulted) {
+        const uint64_t saveNum = g_Telemetry.taskManagerCrashSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (saveNum <= 16) {
+            LogNetcode("[CrashFix] Prevented 0xC0000005 in ccTask::Exec (+0x0109C8E0)! Dangling/corrupt pTask=0x%llX pauseMask=0x%X",
+                       static_cast<unsigned long long>(taskAddr), pauseMask);
+        }
+    }
+}
+
+uint32_t __fastcall hk_TaskMgrAddTask(void* pMgr, void* pTask) {
+    if (!oTaskMgrAddTask || reinterpret_cast<uintptr_t>(pMgr) < kMinValidPtr ||
+        reinterpret_cast<uintptr_t>(pTask) < kMinValidPtr) {
+        return 0u;
+    }
+    const bool locked = TryLockTaskMgrCs(pMgr);
+    const uint32_t rc = oTaskMgrAddTask(pMgr, pTask);
+    UnlockTaskMgrCs(pMgr, locked);
+    return rc;
+}
+
+void __fastcall hk_TaskMgrUpdateRange(void* pMgr, uint32_t startPrio, uint32_t endPrio, uint32_t pauseFlag) {
+    if (!oTaskMgrUpdateRange || reinterpret_cast<uintptr_t>(pMgr) < kMinValidPtr) {
+        return;
+    }
+    s_TaskMgrUpdateDepth.fetch_add(1, std::memory_order_seq_cst);
+    oTaskMgrUpdateRange(pMgr, startPrio, endPrio, pauseFlag);
+    if (s_TaskMgrUpdateDepth.fetch_sub(1, std::memory_order_seq_cst) == 1) {
+        ReapTombstonedTaskNodes(pMgr);
+    }
+}
+
+void __fastcall hk_TaskMgrUpdateSingleParallel(void* pMgr, uint32_t priority, uint32_t pauseFlag) {
+    if (!oTaskMgrUpdateSinglePar || reinterpret_cast<uintptr_t>(pMgr) < kMinValidPtr) {
+        return;
+    }
+    s_TaskMgrUpdateDepth.fetch_add(1, std::memory_order_seq_cst);
+    oTaskMgrUpdateSinglePar(pMgr, priority, pauseFlag);
+    if (s_TaskMgrUpdateDepth.fetch_sub(1, std::memory_order_seq_cst) == 1) {
+        ReapTombstonedTaskNodes(pMgr);
+    }
+}
+
+void __fastcall hk_TaskMgrRemoveTask(void* pMgr, void* pTask) {
+    if (!oTaskMgrRemoveTask || reinterpret_cast<uintptr_t>(pMgr) < kMinValidPtr ||
+        reinterpret_cast<uintptr_t>(pTask) < kMinValidPtr) {
+        return;
+    }
+
+    uint32_t prio = 0xFFFFFFFFu;
+    if (!ReadTaskPrioritySeh(pTask, &prio)) {
+        const uint64_t saveNum = g_Telemetry.taskManagerCrashSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (saveNum <= 16) {
+            LogNetcode("[CrashFix] Prevented 0xC0000005 in ccTaskManager::RemoveTask! Unreadable pTask=0x%llX",
+                       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pTask)));
+        }
+        return;
+    }
+    if (prio >= 128u) {
+        return;
+    }
+
+    const bool locked = TryLockTaskMgrCs(pMgr);
+    s_TaskMgrActiveDeferrals.fetch_add(1, std::memory_order_seq_cst);
+    const auto* pMgrBytes = reinterpret_cast<const uint8_t*>(pMgr);
+    const bool  iterating = (s_TaskMgrUpdateDepth.load(std::memory_order_seq_cst) > 0) ||
+                            (*reinterpret_cast<const int32_t*>(pMgrBytes + 0x14D8) != 0);
+
+    if (iterating) {
+        if (TombstoneTaskInBucketSeh(pMgr, pTask, prio)) {
+            s_LastTombstonedMgr.store(pMgr, std::memory_order_release);
+            s_TaskMgrDirtyMask[prio >> 6].fetch_or(1ULL << (prio & 63u), std::memory_order_seq_cst);
+            g_Telemetry.taskManagerCrashSaves.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t deferCount = s_TaskMgrDeferredCount.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (deferCount <= 4) {
+                LogNetcode("[CrashFix] Deferred ccTaskManager::RemoveTask during active iteration (prio=%u, totalDeferred=%llu) — iterator UAF prevented.",
+                           prio, static_cast<unsigned long long>(deferCount));
+            }
+        }
+        s_TaskMgrActiveDeferrals.fetch_sub(1, std::memory_order_seq_cst);
+        UnlockTaskMgrCs(pMgr, locked);
+        return;
+    }
+    s_TaskMgrActiveDeferrals.fetch_sub(1, std::memory_order_seq_cst);
+
+    oTaskMgrRemoveTask(pMgr, pTask);
+    UnlockTaskMgrCs(pMgr, locked);
+}
+
+void __fastcall hk_TaskMgrDeleteAllTasks(void* pMgr) {
+    if (!oTaskMgrDeleteAllTasks || reinterpret_cast<uintptr_t>(pMgr) < kMinValidPtr) {
+        return;
+    }
+    const bool locked = TryLockTaskMgrCs(pMgr);
+    // Reap any deferred tombstones BEFORE oTaskMgrDeleteAllTasks runs virtual destructors on bucket nodes!
+    ReapTombstonedTaskNodesLocked(pMgr);
+    oTaskMgrDeleteAllTasks(pMgr);
+    UnlockTaskMgrCs(pMgr, locked);
 }
 
 } // namespace StormInternal

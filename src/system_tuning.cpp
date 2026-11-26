@@ -3,6 +3,11 @@
 #include <dxgi.h>
 #include <wlanapi.h>
 #include <algorithm>
+#include <intrin.h>
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 
 namespace StormInternal {
 
@@ -41,6 +46,173 @@ HANDLE                    s_hMmcssHandle       = nullptr;
 fnAvRevertMmThreadChars_t s_fnAvRevertMm       = nullptr;
 std::atomic<bool>         s_MmcssThreadApplied{false};
 ID3D11Device*             s_LastConfiguredD3D11Dev = nullptr;
+
+// Precision drift-free 60.000 / 30.000 Hz frame pacer state (render thread only)
+HANDLE         s_hFramePacerTimer      = nullptr;
+bool           s_FramePacerInit        = false;
+bool           s_FramePacerHighRes     = false;
+int64_t        s_NextFrameQpc          = 0;
+int64_t        s_FrameRem              = 0;
+uint32_t       s_LastFrameDiv          = 0xFFFFFFFFu;
+IDXGISwapChain* s_LastCheckedSwapChain = nullptr;
+uint64_t       s_LastDisplayQueryMs    = 0;
+uint32_t       s_CachedDisplayHz       = 0;
+bool           s_CachedBypassVsync     = false;
+uint32_t       s_LastLoggedBypassHz    = 0;
+
+bool ShouldBypassWindowedNon60HzVsync(IDXGISwapChain* pSwapChain) noexcept {
+    if (!pSwapChain || !g_Config.bypass_non60hz_vsync_judder) {
+        return false;
+    }
+    const uint64_t nowMs = GetTickCount64();
+    if (pSwapChain == s_LastCheckedSwapChain && s_LastDisplayQueryMs != 0 && (nowMs - s_LastDisplayQueryMs) < 2000ULL) {
+        return s_CachedBypassVsync;
+    }
+    s_LastCheckedSwapChain = pSwapChain;
+    s_LastDisplayQueryMs   = nowMs;
+
+    DXGI_SWAP_CHAIN_DESC scDesc{};
+    if (FAILED(pSwapChain->GetDesc(&scDesc)) || scDesc.Windowed == FALSE) {
+        // Never force SyncInterval=0 in exclusive fullscreen where DWM does not prevent tearing
+        s_CachedBypassVsync = false;
+        return false;
+    }
+
+    uint32_t hz = 0;
+    IDXGIOutput* pOutput = nullptr;
+    if (SUCCEEDED(pSwapChain->GetContainingOutput(&pOutput)) && pOutput) {
+        DXGI_OUTPUT_DESC outDesc{};
+        if (SUCCEEDED(pOutput->GetDesc(&outDesc)) && outDesc.Monitor != nullptr) {
+            MONITORINFOEXW mi{};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(outDesc.Monitor, &mi)) {
+                DEVMODEW dm{};
+                dm.dmSize = sizeof(dm);
+                if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1u) {
+                    hz = static_cast<uint32_t>(dm.dmDisplayFrequency);
+                }
+            }
+        }
+        pOutput->Release();
+    }
+
+    s_CachedDisplayHz   = hz;
+    s_CachedBypassVsync = (hz > 62u) && ((hz % 60u) != 0u);
+    if (s_CachedBypassVsync && s_LastLoggedBypassHz != hz) {
+        s_LastLoggedBypassHz = hz;
+        LogNetcode("[FramePacer] Windowed %u Hz display detected (non-60Hz multiple) -> bypassing Present(1,0) VBlank beat; exact 60.000Hz pacer active.",
+                   hz);
+    }
+    return s_CachedBypassVsync;
+}
+
+void InitFramePacerTimerOnce() noexcept {
+    if (s_FramePacerInit) {
+        return;
+    }
+    s_FramePacerInit = true;
+    // Try Windows 10 1803+ / Windows 11 high-resolution waitable timer first (~0.3-0.5ms granularity)
+    s_hFramePacerTimer = CreateWaitableTimerExW(
+        nullptr, nullptr,
+        CREATE_WAITABLE_TIMER_MANUAL_RESET | CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS);
+    if (s_hFramePacerTimer) {
+        s_FramePacerHighRes = true;
+    } else {
+        s_hFramePacerTimer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+        s_FramePacerHighRes = false;
+    }
+    LogNetcode("[FramePacer] Precision drift-free 60.000Hz pacer active (HighResWaitableTimer=%s, Sleep(0) starvation eliminated).",
+               s_FramePacerHighRes ? "YES" : "FALLBACK");
+}
+
+void PaceFrameExact(uint32_t frameDiv, bool vsyncEnabled) noexcept {
+    if (g_QpcFreq.QuadPart <= 0) {
+        return;
+    }
+    InitFramePacerTimerOnce();
+
+    const uint32_t clampedDiv = (frameDiv <= 3u) ? frameDiv : 0u;
+    const int64_t  freq       = g_QpcFreq.QuadPart;
+    const int64_t  num        = freq * static_cast<int64_t>(clampedDiv + 1u);
+    const int64_t  baseTicks  = num / 60LL;
+    const int64_t  remTicks   = num % 60LL;
+
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+
+    if (s_NextFrameQpc == 0 || s_LastFrameDiv != clampedDiv) {
+        s_LastFrameDiv = clampedDiv;
+        s_NextFrameQpc = now.QuadPart;
+        s_FrameRem     = 0;
+        return;
+    }
+
+    // Advance target by exact rational period (1/60s * (frameDiv + 1)) with zero cumulative drift
+    int64_t step = baseTicks;
+    s_FrameRem += remTicks;
+    if (s_FrameRem >= 60LL) {
+        ++step;
+        s_FrameRem -= 60LL;
+    }
+
+    // Gentle clock-slip tracking ONLY during active 60 FPS online battles (bounded 0..350 us):
+    // When remote peer drifts at ~58.8-59.5Hz, smoothly match its cadence to prevent periodic 1-tick stalls.
+    if (clampedDiv == 0u) {
+        const int32_t extraUs = g_FramePacerExtraUs.load(std::memory_order_relaxed);
+        if (extraUs > 0) {
+            const uint64_t lastBattleMs = g_LastActiveBattleTickMs.load(std::memory_order_relaxed);
+            const uint64_t nowMs        = GetTickCount64();
+            if (nowMs >= lastBattleMs && (nowMs - lastBattleMs) <= 250ULL) {
+                step += (freq * static_cast<int64_t>(std::clamp(extraUs, 0, 350))) / 1000000LL;
+            } else {
+                g_FramePacerExtraUs.store(0, std::memory_order_relaxed);
+            }
+        }
+    }
+    s_NextFrameQpc += step;
+
+    // If frame already exceeded target (e.g. 60Hz VSync VBlank, alt-tab, loading screen), do not wait
+    if (now.QuadPart >= s_NextFrameQpc) {
+        if (vsyncEnabled || (now.QuadPart - s_NextFrameQpc) > (baseTicks * 2LL)) {
+            s_NextFrameQpc = now.QuadPart;
+            s_FrameRem     = 0;
+        }
+        return;
+    }
+
+    // Phase 1: True OS sleep while > 1.5 ms remains so lower-priority Steam P2P & NIC threads never starve
+    constexpr int64_t kSpinTailUs = 1200LL;
+    while (true) {
+        QueryPerformanceCounter(&now);
+        const int64_t remQpc = s_NextFrameQpc - now.QuadPart;
+        if (remQpc <= 0) {
+            return;
+        }
+        const int64_t remUs = (remQpc * 1000000LL) / freq;
+        if (remUs <= 1500LL) {
+            break;
+        }
+        if (s_hFramePacerTimer) {
+            LARGE_INTEGER dueTime = {};
+            dueTime.QuadPart = -((remUs - kSpinTailUs) * 10LL); // Negative = relative 100ns units
+            if (dueTime.QuadPart < 0 && SetWaitableTimer(s_hFramePacerTimer, &dueTime, 0, nullptr, nullptr, FALSE)) {
+                WaitForSingleObject(s_hFramePacerTimer, 20);
+                continue;
+            }
+        }
+        Sleep(1);
+    }
+
+    // Phase 2: Sub-millisecond _mm_pause() polish for +-10 us frame-pacing precision
+    while (true) {
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart >= s_NextFrameQpc) {
+            break;
+        }
+        _mm_pause();
+    }
+}
 
 void ApplyRenderThreadMmcssBoostOnce() noexcept {
     if (!g_Config.enable_scheduler_boost || s_MmcssThreadApplied.exchange(true)) {
@@ -170,6 +342,16 @@ void ShutdownProcessGamingBoost(bool processTerminating) noexcept {
         s_TimerPeriodActive = false;
     }
     if (!processTerminating) {
+        if (s_hFramePacerTimer) {
+            CloseHandle(s_hFramePacerTimer);
+            s_hFramePacerTimer = nullptr;
+        }
+        s_FramePacerInit       = false;
+        s_NextFrameQpc         = 0;
+        s_FrameRem             = 0;
+        s_LastCheckedSwapChain = nullptr;
+        s_LastDisplayQueryMs   = 0;
+        s_CachedBypassVsync    = false;
         if (s_hMmcssHandle && s_fnAvRevertMm) {
             s_fnAvRevertMm(s_hMmcssHandle);
             s_hMmcssHandle = nullptr;
@@ -186,12 +368,63 @@ void ShutdownProcessGamingBoost(bool processTerminating) noexcept {
     g_Telemetry.schedulerBoostActive.store(false);
 }
 
+// ============================================================================
+// 0b-2. Lock-Free Invariant-TSC nuccTimer Replacements (+0x13D7490 / +0x13D75B0)
+//       Vanilla NSUNSC.exe inherits a 2006 Ogre3D Windows XP workaround that calls
+//       SetThreadAffinityMask(GetCurrentThread(), Core0) TWICE on every single
+//       timer query (including inside Present's spin loop!), triggering hundreds of
+//       thousands of kernel syscalls/sec & Core-0 migration thrashing where NIC/USB
+//       DPC interrupts execute. Modern Windows QPC is a ~15ns user-mode RDTSC read.
+// ============================================================================
+
+uint64_t __fastcall hk_NuccGetTimeUs() {
+    if (g_BaseAddress) {
+        const int32_t useQpc = *reinterpret_cast<const int32_t*>(g_BaseAddress + StormRva::kData_NuccTimerUseQpc);
+        const int64_t freq   = *reinterpret_cast<const int64_t*>(g_BaseAddress + StormRva::kData_NuccTimerQpcFreq);
+        if (useQpc != 0 && freq > 0) {
+            LARGE_INTEGER now = {};
+            if (QueryPerformanceCounter(&now)) {
+                const int64_t startQpc = *reinterpret_cast<const int64_t*>(g_BaseAddress + StormRva::kData_NuccTimerStartQpc);
+                const int64_t delta    = now.QuadPart - startQpc;
+                if (delta <= 0) {
+                    return 0ULL;
+                }
+                const uint64_t uDelta = static_cast<uint64_t>(delta);
+                const uint64_t uFreq  = static_cast<uint64_t>(freq);
+                return (uDelta / uFreq) * 1000000ULL + ((uDelta % uFreq) * 1000000ULL) / uFreq;
+            }
+        }
+    }
+    return oNuccGetTimeUs ? oNuccGetTimeUs() : 0ULL;
+}
+
+uint32_t __fastcall hk_NuccGetTimeMs() {
+    if (g_BaseAddress) {
+        const int32_t useQpc = *reinterpret_cast<const int32_t*>(g_BaseAddress + StormRva::kData_NuccTimerUseQpc);
+        const int64_t freq   = *reinterpret_cast<const int64_t*>(g_BaseAddress + StormRva::kData_NuccTimerQpcFreq);
+        if (useQpc != 0 && freq > 0) {
+            LARGE_INTEGER now = {};
+            if (QueryPerformanceCounter(&now)) {
+                const int64_t startQpc = *reinterpret_cast<const int64_t*>(g_BaseAddress + StormRva::kData_NuccTimerStartQpc);
+                const int64_t delta    = now.QuadPart - startQpc;
+                if (delta <= 0) {
+                    return 0U;
+                }
+                const uint64_t uDelta = static_cast<uint64_t>(delta);
+                const uint64_t uFreq  = static_cast<uint64_t>(freq);
+                return static_cast<uint32_t>((uDelta / uFreq) * 1000ULL + ((uDelta % uFreq) * 1000ULL) / uFreq);
+            }
+        }
+    }
+    return oNuccGetTimeMs ? oNuccGetTimeMs() : 0U;
+}
+
 void __fastcall hk_NuccD3D11Present(void* pNuccD3D11) {
     ApplyRenderThreadMmcssBoostOnce();
 
-    if (g_Config.enable_low_latency_render && pNuccD3D11) {
-        const auto* pBytes  = reinterpret_cast<const uint8_t*>(pNuccD3D11);
-        auto*       pDevice = *reinterpret_cast<ID3D11Device* const*>(pBytes + 0x48);
+    auto* pMutableBytes = reinterpret_cast<uint8_t*>(pNuccD3D11);
+    if (g_Config.enable_low_latency_render && pMutableBytes) {
+        auto* pDevice = *reinterpret_cast<ID3D11Device* const*>(pMutableBytes + 0x48);
 
         if (pDevice && pDevice != s_LastConfiguredD3D11Dev) {
             s_LastConfiguredD3D11Dev = pDevice;
@@ -218,7 +451,39 @@ void __fastcall hk_NuccD3D11Present(void* pNuccD3D11) {
         }
     }
 
+    // Bypass vanilla's priority-starving Sleep(0) + 16666us drifting busy-spin loop inside
+    // nuccD3D11Device::Present (+0x14173A7..+0x14173ED) while still executing IDXGISwapChain::Present
+    // and any Steam/OBS/RTSS overlays unmodified, then apply exact drift-free 60.000Hz pacing.
+    const bool usePrecisionPacer = g_Config.enable_precision_frame_pacer && pMutableBytes && (hk_NuccGetTimeUs() >= 50000ULL);
+    bool     vsyncEnabled   = false;
+    bool     bypassedVsync  = false;
+    uint8_t  savedVsyncByte = 0;
+    uint32_t frameDiv       = 0;
+    if (usePrecisionPacer) {
+        savedVsyncByte = pMutableBytes[0x128];
+        vsyncEnabled   = (savedVsyncByte != 0);
+        frameDiv       = *reinterpret_cast<const uint32_t*>(pMutableBytes + 0x12C);
+        *reinterpret_cast<uint64_t*>(pMutableBytes + 0x130) = 0ULL;
+
+        if (vsyncEnabled) {
+            auto* pSwapChain = *reinterpret_cast<IDXGISwapChain* const*>(pMutableBytes + 0x60);
+            if (ShouldBypassWindowedNon60HzVsync(pSwapChain)) {
+                pMutableBytes[0x128] = 0; // Present(0, 0) avoids 75/100/144/165Hz VBlank beat in DWM/VRR windowed mode
+                vsyncEnabled         = false;
+                bypassedVsync        = true;
+            }
+        }
+    }
+
     oNuccD3D11Present(pNuccD3D11);
+
+    if (usePrecisionPacer) {
+        if (bypassedVsync) {
+            pMutableBytes[0x128] = savedVsyncByte;
+        }
+        PaceFrameExact(frameDiv, vsyncEnabled);
+        *reinterpret_cast<uint64_t*>(pMutableBytes + 0x130) = hk_NuccGetTimeUs();
+    }
 }
 
 void ApplyWifiGamingLowLatencyMode(bool verboseLog) noexcept {

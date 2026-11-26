@@ -2,6 +2,52 @@
 
 Toutes les évolutions notables de ce projet sont documentées ici.
 
+## [2.9] - 2026-11-26
+
+**Jeu requis : NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS — version 1.71 (Steam, Windows x64).**
+
+### Cadence 60,000 Hz exacte, `ClockSync` & écrans haute fréquence (75 / 100 / 144 / 165 Hz)
+- **Precision Frame Pacer (`EnablePrecisionFramePacer`)** :
+  - Remplacement de la boucle `Sleep(0)` / `Sleep(1)` imprécise du moteur par un `WaitableTimer` haute résolution Windows (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) couplé à un micro-spin QPC final — supprimant la famine CPU `Sleep(0)` ainsi que les chutes accidentelles à 30 FPS lors d'une micro-surcharge frame (> 16,67 ms).
+  - **Déverrouillage du Cœur CPU 0** (`nuccTimer::GetTimeUs` à `+0x13D7490` et `GetTimeMs` à `+0x13D75B0`) : le thread principal n'est plus confiné artificiellement sur le cœur 0.
+- **Synchronisation d'horloge amortie entre pairs (`ClockSync`)** :
+  - Asservissement fin (±25 à ±120 µs/frame max) calé sur l'écart de file lockstep lorsque le PC adverse tourne très légèrement sous ou au-dessus de `60,000 Hz`, éliminant les micro-gels périodiques dus à la dérive quartz entre deux machines.
+- **Suppression du judder VSync fenêtré sur écrans hors multiples de 60 Hz (`BypassNon60HzVsyncJudder`)** :
+  - Détection automatique des modes fenêtré / sans bordure sur les moniteurs `75, 100, 144, 165 Hz` (`hz > 62 && hz % 60 != 0`) et neutralisation ciblée de l'attente VBlank DXGI pendant `Present` lorsque le pacer `60,000 Hz` est actif — supprimant le battement de cadence 144 Hz ↔ 60 Hz sans modifier le plein écran exclusif ni les écrans 60 / 120 / 180 / 240 Hz.
+
+### Gouvernance anti-gigue en plein match, redondance UDP & négociation RTT
+- **Bouclier anti-gigue dynamique en plein combat (`Live Anti-Jitter Shield`) avec hystérésis de retour au calme** :
+  - Détection temps réel des rafales de stalls réseau (fenêtre glissante de 5 s adaptée aux modes 30 / 60 FPS) : passage automatique à `Redundancy = 4`, `Spin = 1600 µs` et Fast NACK accéléré pour absorber la dégradation Wi-Fi/route, suivi d'un **retour automatique au régime nominal après 18 s consécutives sans stall** (tout en restant armé pour la suite du match).
+- **Suppression du gel lockstep sur `checksum == 0x00000000` (`SyncCheckWriter::WriteChecksum` à `+0x06155D0`)** :
+  - Correction d'un faux négatif où un checksum de position légitimement nul (avant l'apparition des personnages ou périodiquement tous les 256 ticks lorsque `popcnt == 0`) bloquait l'envoi/renvoi redondant d'une frame prête (`bReceived != 0`).
+- **Filtre de ping à froid (`RTT-Filter`) & séparation `NetStalls` / `ClockSlip` dans `AutoTune`** :
+  - Filtrage des pics RTT initiaux gonflés par l'ouverture du relais Steam SDR lors de `SyncBase`, afin de ne plus surévaluer le délai négocié au premier match.
+  - Distinction stricte entre vraies pertes/gigues réseau (`NetStalls`) et simples glissements d'horloge (`ClockSlip`) dans l'auto-ajustement en revanche (`AutoTune`), et verrouillage de `m_netDelayFrames` dès le début effectif du combat (`m_bIsStarted != 0`).
+- **Synchronisation `2/2` combattants moddés côté Client en lobby spectateur (`'NM'`)** :
+  - Propagation rétrocompatible du masque des joueurs moddés dans l'annonce `chan=4, subCmd=0x10` (ignorée par le jeu d'origine et par les versions `v2.6..v2.8`), permettant aux Clients moddés d'appliquer les garde-fous optimaux `2/2` même lorsque l'hôte est spectateur, plus détection d'un hôte moddé obsolète en match 30 FPS.
+
+### Nouveaux correctifs de crashs en ligne (`0xC0000005` — 59 hooks & 7 ponts VFX W^X)
+- **Armure complète `ccTaskManager` & `ccTask::Exec` (`+0x109C8E0`, `+0x10D6200..+0x10D70E0`)** :
+  - Synchronisation par `CRITICAL_SECTION` réentrante du moteur, protection contre les pointeurs de tâche nuls ou déjà libérés, et mise en quarantaine (tombstone à vtable neutre + barrière mémoire `seq_cst`) des tâches retirées (`RemoveTask`) pendant le parcours actif de la liste — éliminant une source majeure de crashs Use-After-Free en combat et lors des transitions d'écran.
+- **7 ponts assembleur W^X contre les crashs VFX `m_pCoord == NULL` (`+0x132C99B` et 6 sites jumeaux)** :
+  - Interception atomique en registre (zéro fenêtre TOCTOU, page `PAGE_EXECUTE_READ`) sur les 7 déréférencements non protégés de coordonnées d'effets/particules.
+- **Presets d'équipe & `ccSpSkillCustomizeParam` (`+0x0702220..+0x0702400`, `SaveData::SyncShadow` à `+0x0AEED10`)** :
+  - Blocage des lectures hors bornes sur un `spAtkIndex` corrompu et assainissement automatique des presets d'équipe avant leur synchronisation réseau.
+- **Recherche d'ID de session (`~ccNetIdSearchState` à `+0x016FBB0`, `OnVkFinish` à `+0x0170840`) & clavier AZERTY** :
+  - Suppression du crash Use-After-Free lorsque la fenêtre de recherche d'ID est détruite avant la fermeture du clavier virtuel, et saisie directe des chiffres sur la rangée haute des claviers **AZERTY** (`&é"'(-è_çà`) sans maintenir Majuscule.
+- **Destruction des sockets UDP (`Comm::DestroySockets` à `+0x1168E20` → `+0x117116C`)** :
+  - Correction du crash d'allocateur `operator new(0x28)` libéré via `delete[]` à la fermeture d'une session réseau.
+
+### Sessions personnalisées, lobbies 8 joueurs & fenêtre « Merci de patienter »
+- **Renforcement du déblocage « Merci de patienter » (`MSG_WaitMoment`)** :
+  - Contournement du verrou `BattleState > 0` sur `WaitDlgClose1` (`+0x0103E70`) et `WaitDlgClose2` (`+0x0104290`), et ajout d'un chien de garde continu dans `EndlessLobby::Update` (`+0x06C3DE0`) qui déverrouille l'interface du lobby si les entrées restent bloquées ou si une migration d'hôte (`ChangeOwner`) se fige.
+- **Fin des lobbies « zombies » à 0 membre (`OnMemberLeft` à `+0x113D1E0`)** :
+  - Fermeture propre de la session lorsqu'elle tombe à 0 membre valide (au lieu de laisser le joueur bloqué devant 4 cartes grises vides).
+- **Purge des cartes fantômes & compactage strict des 8 slots de session (`ccNetSessionData::m_slots[8]`)** :
+  - Nettoyage des entrées `BattleTable` orphelines (`RecvBattleTable` à `+0x00F6F30`), déduplication `CheckExistingNewMbr` (`+0x113C8B0`) / `NewMemberTbl::Add` (`+0x1169E20`), compactage strict `0..7` avec `uId = 0` (sans interférer avec le tri `qsort` `+0x11407B0`), rejet atomique d'un `pSlot == nullptr` en lobby plein `8/8`, et alignement de pile ABI x64 + W^X strict sur `LobbySlotNullFixBridge` (`+0x113D7E6`).
+- **Journalisation asynchrone & proxy `d3dcompiler_47.dll` 16 arguments** :
+  - Écriture de `storm_netcode.log` déportée sur un thread dédié sans bloquer la simulation, couverture complète des 14 arguments de `D3DCompile2`, et compilation sans aucun avertissement sous MSVC `/W4 /permissive-` (**59/59 hooks vérifiés via `.pdata`**).
+
 ## [2.8] - 2026-11-15
 
 **Jeu requis : NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS — version 1.71 (Steam, Windows x64).**

@@ -45,17 +45,38 @@ namespace StormRva {
     constexpr uintptr_t kSteam_GetFriendPersonaName   = 0x10BAD40; // VA 0x1410BAD40 .. 0x1410BADE8 (ISteamFriends::GetFriendPersonaName wrapper)
     constexpr uintptr_t kSteam_CopyFriendPersonaNameB = 0x0847A50; // VA 0x140847A50 .. 0x140847A79 (twin SSE over-read @ +0x17 = 0x0847A67)
 
-    // Input / Virtual Keyboard (fixes 0xC0000005 crash @ RVA 0x0120FFB5 & twin @ 0x0120FEE0)
+    // Input / Virtual Keyboard (fixes 0xC0000005 crash @ RVA 0x0120FFB5 & twin @ 0x0120FEE0,
+    // plus ccNetIdSearchState Use-After-Free @ RVA 0x00170878)
     // ccVirtualKeyboard_Win64.cpp (+0x10C7473 & +0x10C7782) passes ([rbx+0x38] + 0x60) without testing
     // m_pKeyboard for NULL, passing 0x60 when GetKeyboardDevice(0) returns NULL.
+    // ~ccNetIdSearchState (+0x016FBB0) never calls ccVirtualKeyboard::Close (+0x10C7910) or clears
+    // [pVkImpl + 0xC0], leaving a dangling callback that crashes in OnVirtualKeyboardFinish (+0x0170878).
     constexpr uintptr_t kGlobalInputBackendPtr        = 0x9751E70; // VA 0x149751E70 (+0x08 -> +0x18 -> KeyboardBackend)
+    constexpr uintptr_t kGlobalInputManagerPtr        = 0x9708328; // VA 0x149708328 (InputManager*, passed to GetKeyboardDevice)
+    constexpr uintptr_t kInput_GetKeyboardDevice      = 0x120FE30; // VA 0x14120FE30 .. 0x14120FE53 (returns &m_keyboards[idx] or NULL)
     constexpr uintptr_t kInput_KeyboardGetPressedChar = 0x120FEB0; // VA 0x14120FEB0 .. 0x14120FF87 (faults @ +0x120FEE0)
     constexpr uintptr_t kInput_KeyboardGetPressedKey  = 0x120FF90; // VA 0x14120FF90 .. 0x141210036 (faults @ +0x120FFB5)
+    constexpr uintptr_t kGlobalVirtualKeyboardPtr     = 0x2335D50; // VA 0x142335D50 (ccVirtualKeyboard*, +0x18 = ccVirtualKeyboard_Win64*)
+    constexpr uintptr_t kVirtualKeyboard_Win64Reset   = 0x10C78A0; // VA 0x1410C78A0 .. 0x1410C7906 (.pdata, closes active VK & frees buffer)
+    constexpr uintptr_t kNetIdSearch_Dtor             = 0x016FBB0; // VA 0x14016FBB0 .. 0x14016FD89 (.pdata, ~ccNetIdSearchState)
+    constexpr uintptr_t kNetIdSearch_OnVkFinish       = 0x0170840; // VA 0x140170840 .. 0x14017095D (.pdata, faults @ +0x0170878)
+    constexpr uintptr_t kVtbl_NetIdSearchState        = 0x179A638; // VA 0x14179A638 (ccNetIdSearchState vtable)
+    constexpr uintptr_t kVtbl_SimpleCmdNetIdSearch    = 0x179A840; // VA 0x14179A840 (ccSimpleCommand<ccNetIdSearchState> vtable)
 
     // Session Abrupt-Disconnect Null-Deref, ChatTemplate UAF & Custom/Private Lobby Duplicate-Player Fixes
     constexpr uintptr_t kCustomLobby_UpdateBattleTable = 0x00F4310; // VA 0x1400F4310 .. 0x1400F4A65 (BattleTable change queue)
+    constexpr uintptr_t kCustomLobby_RecvBattleTable   = 0x00F6F30; // VA 0x1400F6F30 .. 0x1400F73A2 (Host BattleTable packet callback)
     constexpr uintptr_t kCustomLobbyUi_UpdateUserList  = 0x00FF810; // VA 0x1400FF810 .. 0x1400FFBA0 (Custom Lobby UI player rows)
     constexpr uintptr_t kChatTemplate_ClearDynamic     = 0x0150C90; // VA 0x140150C90 .. 0x140150DD4 (faults @ +0x0150CC8 on NULL/dangling entry)
+    // ccSpSkillCustomizeParam (data/spc/spSkillCustomizeParam.xfbin) OOB index fixes (float[5]: 0..4, msg[4]: 0..3):
+    // None of the 5 indexed accessors bounds-check r8d, causing 0xC0000005 @ +0x0702447 (and twins) on corrupted local or remote presets.
+    constexpr uintptr_t kSpSkill_GetFloatParam1        = 0x0702220; // VA 0x140702220 .. 0x140702266 (leaf, float[5] @ +0x2C, faults @ +0x070225B)
+    constexpr uintptr_t kSpSkill_GetFloatParam2        = 0x0702270; // VA 0x140702270 .. 0x1407022B6 (leaf, float[5] @ +0x40, faults @ +0x07022AB)
+    constexpr uintptr_t kSpSkill_GetMsgIdPtr           = 0x07022C0; // VA 0x1407022C0 .. 0x140702307 (leaf, entry[4] @ +0x58, faults @ +0x07022FE)
+    constexpr uintptr_t kSpSkill_GetDwordParam         = 0x0702310; // VA 0x140702310 .. 0x140702359 (leaf, entry[4] @ +0x60, faults @ +0x0702352)
+    constexpr uintptr_t kSpSkill_GetMessageId          = 0x0702400; // VA 0x140702400 .. 0x140702493 (.pdata, entry[4] @ +0x58, faults @ +0x0702447)
+    constexpr uintptr_t kSaveData_SyncShadow           = 0x0AEED10; // VA 0x140AEED10 .. 0x140AEED56 (.pdata, copies g_MainSaveData -> Shadow)
+    constexpr uintptr_t kData_MainSavePreSetArray      = 0x225B7F0; // VA 0x14225B7F0 (ccPreSetSaveData::m_presets[24], stride 0x1C0)
     constexpr uintptr_t kTeamContainer_GetByIndex      = 0x094B3E0; // VA 0x14094B3E0 .. 0x14094B44C (faults @ +0x094B3ED when _Myhead=0)
     constexpr uintptr_t kTeamContainer_FindByCharId    = 0x094B830; // VA 0x14094B830 .. 0x14094B8B7 (faults @ +0x094B837 when _Myhead=0)
     constexpr uintptr_t kTeamContainer_FindByIndex     = 0x094B8C0; // VA 0x14094B8C0 .. 0x14094B96E (faults @ +0x094B8D8 when _Myhead=0)
@@ -63,12 +84,26 @@ namespace StormRva {
     constexpr uintptr_t kSessionData_AddMember         = 0x113AF60; // VA 0x14113AF60 .. 0x14113B3BF (adds SteamID to m_slots[0..7])
     constexpr uintptr_t kSession_AssignNextUId         = 0x113B3C0; // VA 0x14113B3C0 .. 0x14113B3CE (assigns ++[session+0x168] to slot->uId)
     constexpr uintptr_t kSession_FindSlotBySteamId     = 0x113BDC0; // VA 0x14113BDC0 .. 0x14113BE49 (finds slot* in m_slots by SteamID)
+    constexpr uintptr_t kSession_CheckExistingNewMbr   = 0x113C8B0; // VA 0x14113C8B0 .. 0x14113C9E0 (State1_Update existing SteamID check)
+    constexpr uintptr_t kSession_OnMemberLeft          = 0x113D1E0; // VA 0x14113D1E0 .. 0x14113D63E (.pdata, erases self on Steam LobbyChatUpdate -> zombie 0-member lobby)
     constexpr uintptr_t kPatch_LobbyState1SortFix      = 0x113D736; // VA 0x14113D736 .. 0x14113D797 (fixes stale rdi after qsort in State1_Update)
     constexpr uintptr_t kSession_InvokeCallback        = 0x113D840; // VA 0x14113D840 .. 0x14113D889 (invokes OnMemberJoined callback)
     constexpr uintptr_t kSession_SortSlots             = 0x113FA50; // VA 0x14113FA50 .. 0x14113FADB (qsort m_slots & refresh [session+0x500])
+    constexpr uintptr_t kSessionComm_DestroySockets    = 0x1168E20; // VA 0x141168E20 .. 0x141168E91 (.pdata, new vs delete[] mismatch -> 0xC0000005 @ +0x117116C)
     constexpr uintptr_t kSessionComm_SendPacket        = 0x1169290; // VA 0x141169290 .. 0x14116930C (faults @ +0x11692A3 when RCX=0)
     constexpr uintptr_t kSessionComm_BroadcastPacket   = 0x1169310; // VA 0x141169310 .. 0x14116938F (faults @ +0x1169320 when RCX=0)
+    constexpr uintptr_t kSession_NewMemberTblAdd       = 0x1169E20; // VA 0x141169E20 .. 0x141169FBA (NewMemberTbl::Add queue insert)
     constexpr uintptr_t kSession_ProcessMessages       = 0x116DAE0; // VA 0x14116DAE0 .. 0x14116E02B (session packet dispatcher)
+
+    // ccTaskManager iterator-invalidation UAF & parallel lock fixes (fixes 0xC0000005 @ +0x0109C8E0)
+    constexpr uintptr_t kTask_Exec                     = 0x109C8E0; // VA 0x14109C8E0 .. 0x14109C8F3 (leaf, faults @ +0x0109C8E0 `cmp [rcx+0x20], 0`)
+    constexpr uintptr_t kTaskMgr_AddTask               = 0x10D6200; // VA 0x1410D6200 .. 0x1410D62F8 (.pdata, missing [this+0x1470] lock)
+    constexpr uintptr_t kTaskMgr_UpdateRange           = 0x10D6740; // VA 0x1410D6740 .. 0x1410D6AA0 (.pdata, reads [rbx] AFTER ccTask::Exec!)
+    constexpr uintptr_t kTaskMgr_UpdateSingleParallel  = 0x10D6AA0; // VA 0x1410D6AA0 .. 0x1410D6CE7 (.pdata, parallel worker dispatch)
+    constexpr uintptr_t kTaskMgr_RemoveTask            = 0x10D6FE0; // VA 0x1410D6FE0 .. 0x1410D70D8 (.pdata, zeroes & frees node during iteration)
+    constexpr uintptr_t kTaskMgr_DeleteAllTasks        = 0x10D70E0; // VA 0x1410D70E0 .. 0x1410D71CD (.pdata, destroys all tasks in 128 buckets)
+    constexpr uintptr_t kNuccCs_Lock                   = 0x12A7920; // VA 0x1412A7920 (nuccCriticalSection::Lock, recursive)
+    constexpr uintptr_t kNuccCs_Unlock                 = 0x12A7990; // VA 0x1412A7990 (nuccCriticalSection::Unlock)
 
     // ccNetInputBuffer ring buffer methods (ccNetInputBuffer.cpp)
     constexpr uintptr_t kInputBuf_InsertFrameInput  = 0x10ED140; // VA 0x1410ED140 .. 0x1410ED1F1
@@ -105,6 +140,13 @@ namespace StormRva {
 
     // nuccD3D11Device (DirectX 11 / DXGI presentation & frame-latency pipeline)
     constexpr uintptr_t kNuccD3D11_Present          = 0x1417370; // VA 0x141417370 .. 0x1414173FF (+0x48=ID3D11Device*, +0x50=Context*, +0x60=SwapChain*)
+
+    // nuccTimer (eliminates obsolete 2006 SetThreadAffinityMask Core-0 migration on every timer query)
+    constexpr uintptr_t kNuccTimer_GetTimeUs        = 0x13D7490; // VA 0x1413D7490 .. 0x1413D75A9
+    constexpr uintptr_t kNuccTimer_GetTimeMs        = 0x13D75B0; // VA 0x1413D75B0 .. 0x1413D76CA
+    constexpr uintptr_t kData_NuccTimerUseQpc       = 0x97518E4; // VA 0x1497518E4 (int32_t m_UseQpc)
+    constexpr uintptr_t kData_NuccTimerQpcFreq      = 0x97518E8; // VA 0x1497518E8 (int64_t m_QpcFreq)
+    constexpr uintptr_t kData_NuccTimerStartQpc     = 0x97518F0; // VA 0x1497518F0 (int64_t m_StartQpc)
 
     // Exact instruction RVAs for byte-verified CyberConnect2 engine bug fixes:
     // 1) PushResendRequest null-deref (`movups [0], xmm0` when 16-node resend pool is full)
@@ -179,15 +221,13 @@ static_assert(offsetof(ccNetInputBuffer, m_ringHeadSlotIdx) == 0x182B90, "m_ring
 // 0x10 (16) bytes: Intrusive resend request node in ccNetFreeBattleSync (+0x140 .. +0x23F)
 struct ccNetResendNode {
     union {
-        struct {
-            int32_t frameNumber;          // +0x00: When active in m_pResendQueueHead (+0x250)
-            int32_t pad04;                // +0x04
-        };
+        int32_t          frameNumber;     // +0x00: When active in m_pResendQueueHead (+0x250)
         ccNetResendNode* pNextFree;       // +0x00: When on free list m_pResendFreeList (+0x248)
     };
     ccNetResendNode* pNextQueue;          // +0x08: next node in m_pResendQueueHead
 };
 static_assert(sizeof(ccNetResendNode) == 0x10, "ccNetResendNode must be 0x10 bytes");
+static_assert(offsetof(ccNetResendNode, pNextQueue) == 0x08, "ccNetResendNode::pNextQueue offset mismatch");
 
 // 0x0C (12) bytes: Endpoint descriptor passed to ccNetUDPSocket::Send (0x1411623B0)
 struct ccNetUdpEndpoint {
@@ -286,24 +326,26 @@ struct NetcodeConfig {
     int  forced_delay_frames   = -1;   // -1 = adaptive One-Way Latency formula; >= 1 = fixed delay frames
     int  min_delay_frames      = 1;    // Protocol mathematical minimum is 1 frame (Frame 0 is reserved)
     int  max_delay_clamp       = 16;   // Allow up to 16 frames on 300ms+ transcontinental pings (causality-safe)
-    int  jitter_margin_ms      = 2;    // Tight VSync-phase guard (2ms default, 0..10) + automatic RTT/24 route jitter cushion
+    int  jitter_margin_ms      = 2;    // Tight VSync-phase guard (2ms default, 0..10) + automatic +3ms + RTT/13 route cushion
 
     // DirectX 11 Zero-Queue Low-Latency Render & OS Gaming Scheduler Boost
-    bool enable_low_latency_render = true;
-    int  max_frame_latency         = 1;    // IDXGIDevice1::SetMaximumFrameLatency(1) + GPUThreadPriority(+5)
-    bool enable_scheduler_boost    = true; // Win11 EcoQoS/Timer-Coalescing OFF + 1ms timer + MMCSS "Games" thread boost
+    bool enable_low_latency_render    = true;
+    int  max_frame_latency            = 1;    // IDXGIDevice1::SetMaximumFrameLatency(1) + GPUThreadPriority(+5)
+    bool enable_scheduler_boost       = true; // Win11 EcoQoS/Timer-Coalescing OFF + 0.5ms timer + MMCSS "Games" + lock-free QPC timer
+    bool enable_precision_frame_pacer = true; // Replaces vanilla Sleep(0)+16666us drifting spin with exact 60.000Hz WaitableTimer pacer
+    bool bypass_non60hz_vsync_judder  = true; // Bypasses Present(1,0) VBlank beat on windowed non-60Hz displays (75/100/144/165Hz)
 
     // Multi-frame UDP packet redundancy (Vanilla-lookahead-safe packing + single-record auxiliary UDP sends)
     bool enable_packet_redundancy = true;
-    int  redundancy_frame_depth   = 3; // Send [frame - 2, frame - 1, frame] per tick (1..8)
+    int  redundancy_frame_depth   = 3; // Send [frame - 2, frame - 1, frame] per tick (1..4 battler, 1..5 spectator)
     int  max_resend_batch         = 3; // Drain up to 3 NACK resend requests per tick (vanilla drains 1)
 
     // Micro-jitter absorption, Wi-Fi anti-scan gaming mode & stall governance
     bool enable_wifi_gaming_mode      = true; // Win32 wlanapi MediaStreaming=ON + BackgroundScan=OFF while game runs
-    bool enable_dynamic_peer_autotune = true; // Auto +1/+2f rematch cushion if peer exceeds 3% / 18% mid-fight stalls
+    bool enable_dynamic_peer_autotune = true; // Auto +1/+2f rematch cushion if peer exceeds 1.8% / 12% mid-fight net stalls
     bool enable_micro_jitter_poll     = true;
     int  micro_jitter_spin_us         = 1100; // High-precision QPC poll (1100us on tick 0, 650us on tick 1, 25us spacing)
-    bool fast_nack_recovery           = true; // Trigger accelerated NACK at 2 stalled frames (33ms) + retry at 7 (116ms)
+    bool fast_nack_recovery           = true; // Trigger RTT-paced accelerated NACK (2f initial + RTT-spaced retries)
     bool suppress_short_overlay       = true; // Suppress "Transmitting..." dark modal on brief spikes
     int  overlay_threshold_frames     = 180;  // Show "Transmitting..." modal only after 180 frames (3.0s) instead of 30 (0.5s)
 };
@@ -335,6 +377,8 @@ struct NetcodeTelemetry {
     std::atomic<uint64_t> duplicateLobbySlotSaves{0};
     std::atomic<uint64_t> lobbyWaitDeadlockSaves{0};
     std::atomic<uint64_t> chatTemplateCrashSaves{0};
+    std::atomic<uint64_t> spSkillOobSaves{0};
+    std::atomic<uint64_t> taskManagerCrashSaves{0};
 };
 
 extern HMODULE          g_hSelfModule;

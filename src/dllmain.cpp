@@ -4,17 +4,96 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
-#include <mutex>
 #include <share.h>
 
 HMODULE g_hSelfModule = nullptr;
 
 namespace {
-std::mutex        g_LogMutex;
-FILE*             g_LogFile = nullptr;
-std::atomic<bool> s_ProcessExiting{false};
+constexpr size_t  kLogRingCap   = 256;
+constexpr size_t  kLogLineBytes = 1024;
+
+SRWLOCK            g_LogLock            = SRWLOCK_INIT;
+CONDITION_VARIABLE g_LogCv              = CONDITION_VARIABLE_INIT;
+char               g_LogRing[kLogRingCap][kLogLineBytes] = {};
+size_t             g_LogHead            = 0;
+size_t             g_LogTail            = 0;
+size_t             g_LogCount           = 0;
+bool               g_LogThreadRunning   = false;
+bool               g_LogStopRequested   = false;
+HANDLE             g_hLogThread         = nullptr;
+FILE*              g_LogFile            = nullptr;
+std::atomic<bool>  s_ProcessExiting{false};
+
+void WriteLogLineDirect(const char* line, bool flushFile) noexcept {
+    if (g_Config.enable_console) {
+        std::fputs(line, stdout);
+    }
+    if (g_LogFile) {
+        std::fputs(line, g_LogFile);
+        if (flushFile) {
+            std::fflush(g_LogFile);
+        }
+    }
+}
+
+DWORD WINAPI AsyncLoggerThreadProc(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    char localLine[kLogLineBytes];
+
+    while (true) {
+        bool drained = false;
+        AcquireSRWLockExclusive(&g_LogLock);
+        while (g_LogCount == 0 && !g_LogStopRequested) {
+            SleepConditionVariableSRW(&g_LogCv, &g_LogLock, INFINITE, 0);
+        }
+        if (g_LogCount == 0 && g_LogStopRequested) {
+            g_LogThreadRunning = false;
+            ReleaseSRWLockExclusive(&g_LogLock);
+            break;
+        }
+        std::memcpy(localLine, g_LogRing[g_LogHead], kLogLineBytes);
+        g_LogHead = (g_LogHead + 1) % kLogRingCap;
+        --g_LogCount;
+        drained = (g_LogCount == 0);
+        ReleaseSRWLockExclusive(&g_LogLock);
+
+        WriteLogLineDirect(localLine, drained);
+    }
+    return 0;
+}
+
+void StartAsyncLoggerThread() noexcept {
+    AcquireSRWLockExclusive(&g_LogLock);
+    if (!g_LogThreadRunning && !g_LogStopRequested) {
+        HANDLE hThread = CreateThread(nullptr, 0, AsyncLoggerThreadProc, nullptr, 0, nullptr);
+        if (hThread) {
+            g_hLogThread       = hThread;
+            g_LogThreadRunning = true;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_LogLock);
+}
+
+void StopAsyncLoggerThread(bool processTerminating) noexcept {
+    if (processTerminating) {
+        return; // Never wait on threads under process termination / loader lock
+    }
+    HANDLE hToJoin = nullptr;
+    AcquireSRWLockExclusive(&g_LogLock);
+    g_LogStopRequested = true;
+    hToJoin            = g_hLogThread;
+    g_hLogThread       = nullptr;
+    ReleaseSRWLockExclusive(&g_LogLock);
+    WakeAllConditionVariable(&g_LogCv);
+
+    if (hToJoin) {
+        WaitForSingleObject(hToJoin, 300);
+        CloseHandle(hToJoin);
+    }
+}
 
 bool HasNonZeroEnvVar(const wchar_t* name) noexcept {
     wchar_t buf[32] = {};
@@ -81,24 +160,45 @@ std::wstring TrimWide(const std::wstring& s) {
 } // namespace
 
 void LogNetcode(const char* fmt, ...) {
-    char buf[1024];
+    if (!g_Config.enable_console && !g_LogFile) {
+        return;
+    }
+
+    char msg[960];
     va_list args;
     va_start(args, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, args);
+    std::vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
 
     SYSTEMTIME st;
     GetLocalTime(&st);
 
-    std::lock_guard<std::mutex> lock(g_LogMutex);
-    if (g_Config.enable_console) {
-        std::printf("[%02d:%02d:%02d.%03d] %s\n",
-                    st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+    char formatted[kLogLineBytes];
+    std::snprintf(formatted, sizeof(formatted), "[%02d:%02d:%02d.%03d] %s\n",
+                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+
+    if (s_ProcessExiting.load(std::memory_order_acquire)) {
+        return;
     }
-    if (g_LogFile) {
-        std::fprintf(g_LogFile, "[%02d:%02d:%02d.%03d] %s\n",
-                     st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
-        std::fflush(g_LogFile);
+
+    bool enqueued = false;
+    AcquireSRWLockExclusive(&g_LogLock);
+    if (g_LogThreadRunning && !g_LogStopRequested) {
+        if (g_LogCount == kLogRingCap) {
+            g_LogHead = (g_LogHead + 1) % kLogRingCap; // Drop oldest line to keep battle thread non-blocking
+            --g_LogCount;
+        }
+        std::memcpy(g_LogRing[g_LogTail], formatted, kLogLineBytes);
+        g_LogTail = (g_LogTail + 1) % kLogRingCap;
+        ++g_LogCount;
+        enqueued = true;
+    }
+    ReleaseSRWLockExclusive(&g_LogLock);
+
+    if (enqueued) {
+        WakeConditionVariable(&g_LogCv);
+    } else {
+        WriteLogLineDirect(formatted, true);
     }
 }
 
@@ -111,7 +211,7 @@ void WriteDefaultConfigIfMissing(const std::wstring& configPath) {
     if (!out.is_open()) return;
 
     out << "; ============================================================================\n"
-        << "; NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS - Online Crash Fix & Netcode v2.8\n"
+        << "; NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS - Online Crash Fix & Netcode v2.9\n"
         << "; Reverse-Engineered & Verified (.pdata / SteamFriends017 / ccNetFreeBattleSync / D3D11 / WLAN / MMCSS)\n"
         << "; ============================================================================\n\n"
         << "[General]\n"
@@ -123,11 +223,16 @@ void WriteDefaultConfigIfMissing(const std::wstring& configPath) {
         << ";   - NSUNSC.exe+0x010BAD24 & +0x0847A67 (SteamFriends017 SSE 4KB page over-read)\n"
         << ";   - NSUNSC.exe+0x010F1455 & +0x010F2928 (16-slot resend pool null-pointer SSE write)\n"
         << ";   - NSUNSC.exe+0x0113D736..0x0113D7F2 & +0x0116EAC4 (Lobby State1/ProcessMsgs sort-order self-duplication & null-deref)\n"
-        << ";   - NSUNSC.exe+0x01169290, +0x01169310, +0x0113FA50, +0x0116DAE0 (Abrupt disconnect communicator/m_pMySlot null-deref)\n"
+        << ";   - NSUNSC.exe+0x01169290, +0x01169310, +0x0113FA50, +0x0116DAE0, +0x0117116C & +0x0113D1E0 (Abrupt disconnect, new/delete[] socket crash & zombie 0-member lobby)\n"
         << ";   - NSUNSC.exe+0x0113AF60, +0x00F4310, +0x00FF810 (Private/Custom Lobby SteamID & uId deduplication)\n"
-        << ";   - NSUNSC.exe+0x0120FFB5 & +0x0120FEE0 (ccVirtualKeyboard null m_pKeyboard deref)\n"
+        << ";   - NSUNSC.exe+0x0120FFB5, +0x0120FEE0 & +0x00170878 (ccVirtualKeyboard null m_pKeyboard deref & ccNetIdSearchState callback UAF)\n"
         << ";   - NSUNSC.exe+0x012732D8 (nuccFree at-exit heap corruption 0xC0000374)\n"
-        << "FixOnlinePersonaCrash = 1\n\n"
+        << ";   - NSUNSC.exe+0x0702447 & +0x0702220..+0x0702310 (ccSpSkillCustomizeParam OOB spAtkIndex & ccPreSetSaveData sanitizer)\n"
+        << ";   - NSUNSC.exe+0x0109C8E0 & +0x10D6740..+0x10D70E0 (ccTaskManager iterator-invalidation UAF, parallel CS lock & ccTask::Exec armor)\n"
+        << ";   - NSUNSC.exe+0x0132C99B (+ 6 VFX twins) (nuccTrailForceField / VFX m_pCoord TOCTOU null-deref)\n"
+        << "FixOnlinePersonaCrash = 1\n"
+        << "; Fixes Endless / Custom Match Lobby infinite 'Waiting...' modal deadlock\n"
+        << "FixLobbyWaitDeadlock = 1\n\n"
         << "[InputDelay]\n"
         << "EnableCustomDelay = 1\n"
         << "; DelayMode:\n"
@@ -142,15 +247,19 @@ void WriteDefaultConfigIfMissing(const std::wstring& configPath) {
         << "MinDelayFrames = 1\n"
         << "; MaxDelayClamp: 16 allows smooth stall-free play even on 300ms+ transcontinental matches\n"
         << "MaxDelayClamp = 16\n"
-        << "; JitterMarginMs: Tight phase-safe cushion (2ms default, 0..10 + automatic RTT/24 route scaling)\n"
+        << "; JitterMarginMs: Tight phase-safe cushion (2ms default, 0..10 + automatic +3ms + RTT/13 route scaling)\n"
         << "JitterMarginMs = 2\n\n"
         << "[LowLatencyRender]\n"
         << "; Forces IDXGIDevice1::SetMaximumFrameLatency(1) + GPUThreadPriority(+5),\n"
         << "; eliminating ~33.3 ms (2 frames) of Windows default 3-frame DXGI render-queue lag.\n"
         << "EnableLowLatencyRender = 1\n"
         << "MaxFrameLatency = 1\n"
-        << "; Disables Win11 EcoQoS/Timer-Coalescing, locks 0.5ms kernel timer & enables MMCSS 'Games' thread priority\n"
-        << "EnableSchedulerBoost = 1\n\n"
+        << "; Disables Win11 EcoQoS/Timer-Coalescing, locks 0.5ms kernel timer, enables MMCSS 'Games' & removes nuccTimer Core-0 pinning\n"
+        << "EnableSchedulerBoost = 1\n"
+        << "; Replaces vanilla's Sleep(0) priority-starving 16666us drifting spin in Present() with exact 60.000Hz WaitableTimer pacing\n"
+        << "EnablePrecisionFramePacer = 1\n"
+        << "; Bypasses Present(1,0) VBlank beat on windowed non-60Hz displays (75/100/144/165Hz) while keeping 60.000Hz pacing\n"
+        << "BypassNon60HzVsyncJudder = 1\n\n"
         << "[PacketRedundancy]\n"
         << "; Vanilla-Lookahead-Safe multi-frame UDP redundancy + burst-loss window persistence.\n"
         << "; Validated against NSUNSC.exe+0x10F299B so unmodded opponents NEVER drop mixed-size packets.\n"
@@ -161,12 +270,12 @@ void WriteDefaultConfigIfMissing(const std::wstring& configPath) {
         << "; Prevents Windows 65-second Wi-Fi background channel scans & enables Media Streaming low-latency\n"
         << "; mode via Win32 wlanapi.dll while NSUNSC.exe is running (automatically restored on game exit).\n"
         << "EnableWifiGamingMode = 1\n"
-        << "; Automatically adds +1/+2 frame cushion on rematches if a peer had >=3% / >=18% mid-fight stalls\n"
+        << "; Automatically adds +1/+2 frame cushion on rematches if a peer had >=1.8% / >=12% mid-fight net stalls\n"
         << "EnableDynamicPeerAutoTune = 1\n"
         << "; High-precision dual-edge QPC poll (1100us tick 0, 650us tick 1, 25us step) across 16.67ms VSync boundaries\n"
         << "EnableMicroJitterPoll = 1\n"
         << "MicroJitterSpinUs = 1100\n"
-        << "; Triggers accelerated NACK at 2 stalled frames (33ms) + single backup retry at 7 frames (116ms)\n"
+        << "; Triggers RTT-paced accelerated NACK (2f/3f initial + RTT-spaced backup retry, zero duplicate NACK spam)\n"
         << "FastNackRecovery = 1\n"
         << "; Suppresses the intrusive dark 'Transmitting...' modal on brief spikes (< 180 frames / 3.0s)\n"
         << "SuppressShortOverlay = 1\n"
@@ -225,7 +334,6 @@ void LoadConfig(const std::wstring& configPath) {
         } else if (key == L"MaxDelayClamp") {
             g_Config.max_delay_clamp = std::clamp(intVal, 1, 16);
         } else if (key == L"JitterMarginMs") {
-            if (intVal == 8 || intVal == 5 || intVal == 3) intVal = 2; // Upgrade legacy defaults to tighter 2ms floor
             g_Config.jitter_margin_ms = std::clamp(intVal, 0, 10);
         } else if (key == L"EnableLowLatencyRender") {
             g_Config.enable_low_latency_render = (intVal != 0);
@@ -233,10 +341,14 @@ void LoadConfig(const std::wstring& configPath) {
             g_Config.max_frame_latency = std::clamp(intVal, 1, 3);
         } else if (key == L"EnableSchedulerBoost") {
             g_Config.enable_scheduler_boost = (intVal != 0);
+        } else if (key == L"EnablePrecisionFramePacer") {
+            g_Config.enable_precision_frame_pacer = (intVal != 0);
+        } else if (key == L"BypassNon60HzVsyncJudder") {
+            g_Config.bypass_non60hz_vsync_judder = (intVal != 0);
         } else if (key == L"EnablePacketRedundancy") {
             g_Config.enable_packet_redundancy = (intVal != 0);
         } else if (key == L"RedundancyFrameDepth") {
-            g_Config.redundancy_frame_depth = std::clamp(intVal, 1, 6);
+            g_Config.redundancy_frame_depth = std::clamp(intVal, 1, 5);
         } else if (key == L"MaxResendBatch") {
             g_Config.max_resend_batch = std::clamp(intVal, 1, 4);
         } else if (key == L"EnableWifiGamingMode") {
@@ -246,7 +358,6 @@ void LoadConfig(const std::wstring& configPath) {
         } else if (key == L"EnableMicroJitterPoll") {
             g_Config.enable_micro_jitter_poll = (intVal != 0);
         } else if (key == L"MicroJitterSpinUs") {
-            if (intVal == 850) intVal = 1100; // Upgrade legacy v2.6 default to 1100us
             g_Config.micro_jitter_spin_us = std::clamp(intVal, 0, 2000);
         } else if (key == L"FastNackRecovery") {
             g_Config.fast_nack_recovery = (intVal != 0);
@@ -297,19 +408,26 @@ DWORD WINAPI MainThread(LPVOID) {
         FILE* fp = nullptr;
         freopen_s(&fp, "CONOUT$", "w", stdout);
         freopen_s(&fp, "CONOUT$", "w", stderr);
-        SetConsoleTitleA("NARUTO STORM CONNECTIONS - Netcode Overhaul Engine v2.8");
+        SetConsoleTitleA("NARUTO STORM CONNECTIONS - Netcode Overhaul Engine v2.9");
+    }
+
+    if (g_Config.enable_console || g_LogFile) {
+        StartAsyncLoggerThread();
     }
 
     LogNetcode("========================================================================");
-    LogNetcode("  NARUTO X BORUTO STORM CONNECTIONS - ONLINE CRASH FIX & NETCODE v2.8  ");
-    LogNetcode("  Session & WaitDialog Armor + Spectator 60 FPS + 0.5ms Sub-ms Timer  ");
+    LogNetcode("  NARUTO X BORUTO STORM CONNECTIONS - ONLINE CRASH FIX & NETCODE v2.9   ");
+    LogNetcode("  Lobby Clone/Wait Armor + Balanced RTT + Spectator 60FPS + 60Hz Pacer ");
     LogNetcode("========================================================================");
-    LogNetcode("[Config] OnlinePersonaCrashFix=%s | NetcodeOverhaul=%s | LowLatencyD3D11=%s (MaxQ=%d, SchedBoost=%s)",
+    LogNetcode("[Config] OnlinePersonaCrashFix=%s | LobbyWaitFix=%s | NetcodeOverhaul=%s | LowLatencyD3D11=%s (MaxQ=%d, SchedBoost=%s, Pacer=%s, VsyncGuard=%s)",
                g_Config.fix_online_persona_crash ? "ON" : "OFF",
+               g_Config.fix_lobby_wait_deadlock ? "ON" : "OFF",
                g_Config.enable_netcode_overhaul ? "ON" : "OFF",
                g_Config.enable_low_latency_render ? "ON" : "OFF",
                g_Config.max_frame_latency,
-               g_Config.enable_scheduler_boost ? "ON" : "OFF");
+               g_Config.enable_scheduler_boost ? "ON" : "OFF",
+               g_Config.enable_precision_frame_pacer ? "ON" : "OFF",
+               g_Config.bypass_non60hz_vsync_judder ? "ON" : "OFF");
     LogNetcode("[Config] DelayMode=%d | ForcedDelay=%d | MinFloor=%d f | MaxClamp=%d f | JitterMargin=%d ms | AutoTune=%s",
                g_Config.delay_mode, g_Config.forced_delay_frames,
                g_Config.min_delay_frames, g_Config.max_delay_clamp, g_Config.jitter_margin_ms,
@@ -341,6 +459,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
         const bool processTerminating = (lpReserved != nullptr);
         s_ProcessExiting.store(true, std::memory_order_release);
         ShutdownNetcodeHooks(processTerminating);
+        StopAsyncLoggerThread(processTerminating);
         if (!processTerminating && g_LogFile) {
             std::fclose(g_LogFile);
             g_LogFile = nullptr;

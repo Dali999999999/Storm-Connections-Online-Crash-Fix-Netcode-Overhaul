@@ -57,7 +57,7 @@ bool IsLocalFrameReadyForSend(ccNetFreeBattleSync* pSync, int32_t frameNumber) {
     }
 
     const ccNetSlotPlayerEntry& entry = slot->players[myIdx];
-    return (entry.bReceived != 0 && entry.checksum != 0);
+    return (entry.bReceived != 0);
 }
 
 // Exact instruction-by-instruction simulation of unmodded NSUNSC.exe's ReceivePackets parser
@@ -203,23 +203,19 @@ void SendAuxiliaryDatagramToBattlers(ccNetFreeBattleSync* pSync, const uint8_t* 
     const int32_t myMemberId = static_cast<int32_t>(pSync->m_memberIds[mySlot]);
 
     const auto* pSessBytes = reinterpret_cast<const uint8_t*>(pSync->m_pNetSession);
-    const int32_t sessMemberCount = std::clamp(*reinterpret_cast<const int32_t*>(pSessBytes + 0x2C), 0, 16);
-    if (sessMemberCount <= 0) {
-        return;
-    }
 
     for (int32_t b = 0; b < battlerCount; ++b) {
         const int32_t targetMemberId = static_cast<int32_t>(pSync->m_memberIds[b]);
-        if (targetMemberId == myMemberId) {
+        if (targetMemberId < 0 || targetMemberId == myMemberId) {
             continue;
         }
 
-        for (int32_t i = 0; i < sessMemberCount; ++i) {
+        for (int32_t i = 0; i < 8; ++i) {
             const uint8_t* entryPtr = pSessBytes + 0x13C + static_cast<size_t>(i) * 0x48;
             const int32_t entryMemberId = *reinterpret_cast<const int32_t*>(entryPtr + 0x40);
             if (entryMemberId == targetMemberId) {
                 const uint64_t remoteSteamId = *reinterpret_cast<const uint64_t*>(entryPtr + 0x38);
-                if (remoteSteamId != 0) {
+                if (IsValidSteamId(remoteSteamId)) {
                     ccNetUdpEndpoint endpoint{ remoteSteamId, 6u };
                     g_fnUdpSocketSend(pSync->m_udpSocket, &endpoint, data, dataSize);
                     g_Telemetry.auxDatagramsSent.fetch_add(1, std::memory_order_relaxed);
@@ -318,13 +314,15 @@ int32_t ResolveLocalMemberId(const ccNetFreeBattleSync* pSync, int32_t battlerCo
     return static_cast<int32_t>(pSync->m_memberIds[mySlot]);
 }
 
-uint64_t FindSessionSteamIdForMember(const uint8_t* pSession, uint32_t sessionMemberCount, int32_t memberId) noexcept {
+uint64_t FindSessionSteamIdForMember(const uint8_t* pSession, int32_t memberId) noexcept {
     if (!pSession || memberId < 0) return 0;
-    const uint32_t capped = std::min<uint32_t>(sessionMemberCount, 16u);
-    for (uint32_t i = 0; i < capped; ++i) {
+    for (int32_t i = 0; i < 8; ++i) {
         const uint8_t* entry = pSession + 0x13C + static_cast<size_t>(i) * 0x48;
         if (*reinterpret_cast<const int32_t*>(entry + 0x40) == memberId) {
-            return *reinterpret_cast<const uint64_t*>(entry + 0x38);
+            const uint64_t sid = *reinterpret_cast<const uint64_t*>(entry + 0x38);
+            if (IsValidSteamId(sid)) {
+                return sid;
+            }
         }
     }
     return 0;
@@ -334,16 +332,30 @@ uint64_t FindSessionSteamIdForMember(const uint8_t* pSession, uint32_t sessionMe
 // spectators (w >= 1) on Channel 6 so an unmodded 30 FPS Head Spectator never throttles them to 30 FPS.
 void RelayConfirmedFramesToSecondarySpectators(ccNetFreeBattleSync* pSync,
                                                  const uint8_t* pSession,
-                                                 uint32_t sessionMemberCount,
                                                  int32_t battlerCount,
                                                  int32_t myMemberId) noexcept {
     if (!pSync || !pSync->m_pInputBuffer || !pSession || !g_fnUdpSocketSend) return;
-    if (pSync->m_battlerCount != 2 || sessionMemberCount <= static_cast<uint32_t>(battlerCount)) return;
+    if (pSync->m_battlerCount != 2) return;
     if (*reinterpret_cast<void* const*>(pSync->m_udpSocket + 0x18) == nullptr) return;
 
     const ccNetInputBuffer* pBuf = pSync->m_pInputBuffer;
     const int32_t confirmedFrame = pBuf->m_confirmedAllPlayersFrame;
     if (confirmedFrame < 1) {
+        return;
+    }
+
+    // Check upfront whether at least 2 valid spectators exist (so w >= 1 has a recipient)
+    int32_t validWatchers = 0;
+    for (int32_t w = 0; w < (8 - battlerCount); ++w) {
+        const int32_t candidateId = static_cast<int32_t>(pSync->m_memberIds[battlerCount + w]);
+        if (candidateId < 0 || candidateId == myMemberId) {
+            continue;
+        }
+        if (FindSessionSteamIdForMember(pSession, candidateId) != 0) {
+            ++validWatchers;
+        }
+    }
+    if (validWatchers < 2) {
         return;
     }
 
@@ -396,7 +408,7 @@ void RelayConfirmedFramesToSecondarySpectators(ccNetFreeBattleSync* pSync,
         if (candidateId < 0 || candidateId == myMemberId) {
             continue;
         }
-        const uint64_t steamId = FindSessionSteamIdForMember(pSession, sessionMemberCount, candidateId);
+        const uint64_t steamId = FindSessionSteamIdForMember(pSession, candidateId);
         if (steamId == 0) {
             continue;
         }
@@ -450,11 +462,6 @@ void PreWarmSessionPeersOnChannel6(bool bypassThrottle) noexcept {
         localMemberId = *reinterpret_cast<const int32_t*>(pLocalInfo + 0x24);
     }
 
-    const int32_t sessCount = std::clamp(*reinterpret_cast<const int32_t*>(pSession + 0x2C), 0, 16);
-    if (sessCount <= 1) {
-        return;
-    }
-
     alignas(4) static constexpr uint32_t kWarmupNoOp12[3] = { 0x00000000u, 0x00000001u, 0x00000001u };
     const auto* rawNoOp = reinterpret_cast<const uint8_t*>(kWarmupNoOp12);
 
@@ -463,11 +470,11 @@ void PreWarmSessionPeersOnChannel6(bool bypassThrottle) noexcept {
     *reinterpret_cast<void**>(dummySock + 0x18) = dummyScratch;
 
     bool sentAny = false;
-    for (int32_t i = 0; i < sessCount; ++i) {
+    for (int32_t i = 0; i < 8; ++i) {
         const uint8_t* entry    = pSession + 0x13C + static_cast<size_t>(i) * 0x48;
         const int32_t  memberId = *reinterpret_cast<const int32_t*>(entry + 0x40);
         const uint64_t steamId  = *reinterpret_cast<const uint64_t*>(entry + 0x38);
-        if (steamId == 0 || memberId == localMemberId) {
+        if (!IsValidSteamId(steamId) || memberId == localMemberId) {
             continue;
         }
         ccNetUdpEndpoint ep{ steamId, 6u };
@@ -501,18 +508,15 @@ void PreWarmBattleUdpChannel(ccNetFreeBattleSync* pSync) noexcept {
     const int32_t  battlerCount = std::clamp(pSync->m_battlerCount, 0, 8);
     const int32_t  myMemberId   = ResolveLocalMemberId(pSync, battlerCount);
     const auto*    pSession     = reinterpret_cast<const uint8_t*>(pSync->m_pNetSession);
-    const uint32_t sessCount    = *reinterpret_cast<const uint32_t*>(pSession + 0x2C);
-    if (sessCount > static_cast<uint32_t>(battlerCount)) {
-        for (int32_t w = 0; w < (8 - battlerCount); ++w) {
-            const int32_t candidateId = static_cast<int32_t>(pSync->m_memberIds[battlerCount + w]);
-            if (candidateId < 0 || candidateId == myMemberId) {
-                continue;
-            }
-            const uint64_t watcherSteamId = FindSessionSteamIdForMember(pSession, sessCount, candidateId);
-            if (watcherSteamId != 0) {
-                ccNetUdpEndpoint ep{ watcherSteamId, 6u };
-                g_fnUdpSocketSend(pSync->m_udpSocket, &ep, rawNoOp, 12u);
-            }
+    for (int32_t w = 0; w < (8 - battlerCount); ++w) {
+        const int32_t candidateId = static_cast<int32_t>(pSync->m_memberIds[battlerCount + w]);
+        if (candidateId < 0 || candidateId == myMemberId) {
+            continue;
+        }
+        const uint64_t watcherSteamId = FindSessionSteamIdForMember(pSession, candidateId);
+        if (watcherSteamId != 0) {
+            ccNetUdpEndpoint ep{ watcherSteamId, 6u };
+            g_fnUdpSocketSend(pSync->m_udpSocket, &ep, rawNoOp, 12u);
         }
     }
 }
@@ -586,25 +590,35 @@ int32_t __fastcall hk_BuildBattlerSendPacket(ccNetFreeBattleSync* pSync) {
     }
     std::sort(resendFrames, resendFrames + resendCount);
 
-    // 4. Transmit any explicit NACK-requested resend frames as individual 1-record UDP datagrams
-    //    (remain == 0 <= 12 -> 100% immune to vanilla's lookahead bug!).
+    // 4. Helper to transmit any explicit NACK-requested resend frames as individual 1-record UDP datagrams
+    //    (remain == 0 <= 12 -> 100% immune to vanilla's lookahead bug!), skipping ONLY frames that
+    //    were actually packed into the main datagram's Vanilla-Safe suffix.
     int32_t auxFramesDelivered = 0;
-    for (int32_t r = 0; r < resendCount; ++r) {
-        if (s_SameFrameSendCount == 1 && resendFrames[r] >= (currentFrame - 2)) {
-            continue; // Will be covered by current frame's sliding window
-        }
-        uint8_t singleBuf[32] = {};
-        alignas(16) ccNetFrameInputPacket pkt = {};
-        g_fnFreeSyncExtractFramePkt(pSync, &pkt, resendFrames[r]);
-        if (pkt.frameNumber != 0 && pkt.checksum != 0) {
-            uint8_t* endPtr = g_fnFreeSyncSerializeOneFrm(singleBuf, &pkt);
-            const uint32_t singleLen = static_cast<uint32_t>(endPtr - singleBuf);
-            if (singleLen >= 12) {
-                SendAuxiliaryDatagramToBattlers(pSync, singleBuf, singleLen);
-                ++auxFramesDelivered;
+    auto sendUncoveredResends = [&](const int32_t* coveredFrames, int32_t coveredCount) {
+        for (int32_t r = 0; r < resendCount; ++r) {
+            bool covered = false;
+            for (int32_t c = 0; c < coveredCount; ++c) {
+                if (coveredFrames[c] == resendFrames[r]) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (covered) {
+                continue;
+            }
+            uint8_t singleBuf[32] = {};
+            alignas(16) ccNetFrameInputPacket pkt = {};
+            g_fnFreeSyncExtractFramePkt(pSync, &pkt, resendFrames[r]);
+            if (pkt.frameNumber != 0) {
+                uint8_t* endPtr = g_fnFreeSyncSerializeOneFrm(singleBuf, &pkt);
+                const uint32_t singleLen = static_cast<uint32_t>(endPtr - singleBuf);
+                if (singleLen >= 12) {
+                    SendAuxiliaryDatagramToBattlers(pSync, singleBuf, singleLen);
+                    ++auxFramesDelivered;
+                }
             }
         }
-    }
+    };
 
     // 5. CRITICAL ANTI-FLOOD GUARD FOR STALLED TICKS (s_SameFrameSendCount > 1):
     //    Normally, while stalled waiting for a remote input mid-fight, silence keeps Wi-Fi un-congested.
@@ -612,6 +626,7 @@ int32_t __fastcall hk_BuildBattlerSendPacket(ccNetFreeBattleSync* pSync) {
     //    may still be finishing NAT/ICE handshake, so keep Channel 6 alive gently and rotate unconfirmed
     //    opening frames [m_netDelayFrames .. currentFrame - 1] so no opening frames remain lost!
     if (s_SameFrameSendCount > 1) {
+        sendUncoveredResends(nullptr, 0);
         const int32_t confFrame        = pSync->m_pInputBuffer->m_confirmedAllPlayersFrame;
         const int32_t delayFloor       = std::max<int32_t>(1, pSync->m_netDelayFrames);
         const bool    inStartupLockstep = (confFrame < delayFloor);
@@ -645,7 +660,7 @@ int32_t __fastcall hk_BuildBattlerSendPacket(ccNetFreeBattleSync* pSync) {
                             uint8_t singleBuf[32] = {};
                             alignas(16) ccNetFrameInputPacket pkt = {};
                             g_fnFreeSyncExtractFramePkt(pSync, &pkt, candFrame);
-                            if (pkt.frameNumber != 0 && pkt.checksum != 0) {
+                            if (pkt.frameNumber != 0) {
                                 uint8_t* endPtr = g_fnFreeSyncSerializeOneFrm(singleBuf, &pkt);
                                 const uint32_t singleLen = static_cast<uint32_t>(endPtr - singleBuf);
                                 if (singleLen >= 12) {
@@ -664,7 +679,7 @@ int32_t __fastcall hk_BuildBattlerSendPacket(ccNetFreeBattleSync* pSync) {
         if (IsLocalFrameReadyForSend(pSync, currentFrame)) {
             alignas(16) ccNetFrameInputPacket curPkt = {};
             g_fnFreeSyncExtractFramePkt(pSync, &curPkt, currentFrame);
-            if (curPkt.frameNumber != 0 && curPkt.checksum != 0) {
+            if (curPkt.frameNumber != 0) {
                 uint8_t* writePtr = pSync->m_pRawUdpSendBuf + clampedPrefixBytes;
                 uint8_t* endPtr   = g_fnFreeSyncSerializeOneFrm(writePtr, &curPkt);
                 const uint32_t candidateTotal = static_cast<uint32_t>(endPtr - pSync->m_pRawUdpSendBuf);
@@ -700,7 +715,7 @@ int32_t __fastcall hk_BuildBattlerSendPacket(ccNetFreeBattleSync* pSync) {
     auto serializeSingleFrame = [&](int32_t frameNum, uint8_t outBuf[32]) -> uint32_t {
         alignas(16) ccNetFrameInputPacket pkt = {};
         g_fnFreeSyncExtractFramePkt(pSync, &pkt, frameNum);
-        if (pkt.frameNumber == 0 || pkt.checksum == 0) {
+        if (pkt.frameNumber == 0) {
             return 0;
         }
         uint8_t* endPtr = g_fnFreeSyncSerializeOneFrm(outBuf, &pkt);
@@ -708,22 +723,27 @@ int32_t __fastcall hk_BuildBattlerSendPacket(ccNetFreeBattleSync* pSync) {
     };
 
     if (windowCount <= 0) {
+        sendUncoveredResends(nullptr, 0);
         pSync->m_rawUdpSendSize = clampedPrefixBytes;
         return auxFramesDelivered;
     }
 
-    // 7. Pre-serialize each frame in windowFrames
+    // 7. Pre-serialize each frame in windowFrames (preserving exact frame number per blob)
     uint8_t  winBlobs[6][32] = {};
     uint32_t winLens[6]      = {};
+    int32_t  winFrameNums[6] = {};
     int32_t  validWinCount   = 0;
     for (int32_t w = 0; w < windowCount; ++w) {
         const uint32_t len = serializeSingleFrame(windowFrames[w], winBlobs[validWinCount]);
         if (len >= 12) {
-            winLens[validWinCount++] = len;
+            winLens[validWinCount]      = len;
+            winFrameNums[validWinCount] = windowFrames[w];
+            ++validWinCount;
         }
     }
 
     if (validWinCount <= 0) {
+        sendUncoveredResends(nullptr, 0);
         pSync->m_rawUdpSendSize = clampedPrefixBytes;
         return auxFramesDelivered;
     }
@@ -750,10 +770,16 @@ int32_t __fastcall hk_BuildBattlerSendPacket(ccNetFreeBattleSync* pSync) {
 
     const int32_t mainFramesPacked = validWinCount - bestStart;
 
-    // 9. If bestStart > 0, rewrite the chosen Vanilla-Safe suffix into m_pRawUdpSendBuf.
-    //    To prevent Wi-Fi UDP packet-rate doubling and reordering, ONLY send a single-record
-    //    auxiliary datagram for (currentFrame - 1) when mainFramesPacked == 1 (i.e. input size
-    //    transitioned on currentFrame so 0 redundant frames fit in the main packet) and no NACKs are prefixed.
+    // 9. Deliver any explicit NACK-requested resend frame that did NOT fit into the main
+    //    Vanilla-Safe suffix (fixes silent resend drops when Redundancy is off, depth < 3,
+    //    or bestStart > 0 due to an input-size transition).
+    sendUncoveredResends(winFrameNums + bestStart, mainFramesPacked);
+
+    // 10. If bestStart > 0, rewrite the chosen Vanilla-Safe suffix into m_pRawUdpSendBuf.
+    //     To prevent Wi-Fi UDP packet-rate doubling and reordering, ONLY send a single-record
+    //     auxiliary datagram for (currentFrame - 1) when mainFramesPacked == 1 (i.e. input size
+    //     transitioned on currentFrame so 0 redundant frames fit in the main packet) and no NACKs
+    //     or explicit resends were already sent this tick.
     if (bestStart > 0) {
         if (mainFramesPacked == 1 && validWinCount >= 2 && clampedPrefixBytes == 0 && auxFramesDelivered == 0) {
             SendAuxiliaryDatagramToBattlers(pSync, winBlobs[validWinCount - 2], winLens[validWinCount - 2]);
@@ -810,26 +836,15 @@ void __fastcall hk_SendSpectatorPacket(ccNetFreeBattleSync* pSync) {
         return;
     }
 
-    const uint32_t sessionMemberCount = *reinterpret_cast<const uint32_t*>(pSession + 0x2C);
-    if (sessionMemberCount <= static_cast<uint32_t>(battlerCount)) {
-        oSendSpectatorPacket(pSync);
-        return;
-    }
-
     int32_t  headWatcherMemberId = -1;
     uint64_t headWatcherSteamId  = 0;
     for (int32_t w = 0; w < (8 - battlerCount); ++w) {
         const int32_t candidateId = static_cast<int32_t>(pSync->m_memberIds[battlerCount + w]);
         if (candidateId < 0) continue;
-        for (uint32_t i = 0; i < sessionMemberCount && i < 16; ++i) {
-            const uint8_t* entry = pSession + 0x13C + static_cast<size_t>(i) * 0x48;
-            if (*reinterpret_cast<const int32_t*>(entry + 0x40) == candidateId) {
-                headWatcherMemberId = candidateId;
-                headWatcherSteamId  = *reinterpret_cast<const uint64_t*>(entry + 0x38);
-                break;
-            }
-        }
-        if (headWatcherMemberId != -1) {
+        const uint64_t sid = FindSessionSteamIdForMember(pSession, candidateId);
+        if (sid != 0) {
+            headWatcherMemberId = candidateId;
+            headWatcherSteamId  = sid;
             break;
         }
     }
@@ -842,7 +857,7 @@ void __fastcall hk_SendSpectatorPacket(ccNetFreeBattleSync* pSync) {
 
     // Stream confirmed 1v1 relay frames (desyncHash=0) directly to non-head Spectators (w >= 1)
     // before any stalled early return so an unmodded 30 FPS Head Spectator never throttles them.
-    RelayConfirmedFramesToSecondarySpectators(pSync, pSession, sessionMemberCount, battlerCount, myMemberId);
+    RelayConfirmedFramesToSecondarySpectators(pSync, pSession, battlerCount, myMemberId);
 
     // 2. Build ascending sliding window [currentFrame - effectiveDepth + 1 .. currentFrame]
     const int32_t currentFrame = pSync->m_sendFrameCounter;
@@ -854,7 +869,7 @@ void __fastcall hk_SendSpectatorPacket(ccNetFreeBattleSync* pSync) {
     }
 
     int32_t configuredDepth = g_Config.enable_packet_redundancy
-        ? std::clamp(std::max(g_Config.redundancy_frame_depth, 3), 1, 5)
+        ? std::clamp(g_Config.redundancy_frame_depth, 1, 5)
         : 1;
     if (g_LiveAntiJitterActive.load()) {
         configuredDepth = std::clamp(std::max(configuredDepth, g_LiveAntiJitterRedundancyDepth.load()), 1, 5);
@@ -934,7 +949,7 @@ void __fastcall hk_SendSpectatorPacket(ccNetFreeBattleSync* pSync) {
     auto appendSerializedFrame = [&](int32_t frameNum) {
         alignas(16) ccNetFrameInputPacket pkt = {};
         g_fnFreeSyncExtractFramePkt(pSync, &pkt, frameNum);
-        if (pkt.frameNumber != 0 && pkt.checksum != 0) {
+        if (pkt.frameNumber != 0) {
             writePtr = g_fnFreeSyncSerializeOneFrm(writePtr, &pkt);
         }
     };
@@ -954,7 +969,7 @@ void __fastcall hk_SendSpectatorPacket(ccNetFreeBattleSync* pSync) {
         ccNetUdpEndpoint ep = {};
         ep.steamId = headWatcherSteamId;
         ep.channel = 6u; // Battle FrameSync P2P channel
-        g_fnUdpSocketSend(&pSync->m_udpSocket, &ep, rawBase, totalBytes);
+        g_fnUdpSocketSend(pSync->m_udpSocket, &ep, rawBase, totalBytes);
     }
 }
 
@@ -979,9 +994,8 @@ void __fastcall hk_SendWatcherRelayPacket(ccNetFreeBattleSync* pSync, int32_t ta
         return;
     }
 
-    const auto*    pSession  = reinterpret_cast<const uint8_t*>(pSync->m_pNetSession);
-    const uint32_t sessCount = *reinterpret_cast<const uint32_t*>(pSession + 0x2C);
-    const uint64_t targetSteamId = FindSessionSteamIdForMember(pSession, sessCount, targetMemberId);
+    const auto*    pSession      = reinterpret_cast<const uint8_t*>(pSync->m_pNetSession);
+    const uint64_t targetSteamId = FindSessionSteamIdForMember(pSession, targetMemberId);
     if (targetSteamId == 0) {
         oSendWatcherRelayPacket(pSync, targetMemberId);
         return;
