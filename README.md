@@ -1,4 +1,4 @@
-# Storm Connections — Online Crash Fix & Netcode Overhaul (v2.9)
+# Storm Connections — Online Crash Fix & Netcode Overhaul (v2.10)
 
 Correctif de crash en ligne et refonte du netcode pour **NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS** (PC / Steam).
 
@@ -13,7 +13,7 @@ Correctif de crash en ligne et refonte du netcode pour **NARUTO X BORUTO Ultimat
 
 ## Sommaire
 
-- [Nouveautés de la v2.9](#-nouveautés-de-la-v29)
+- [Nouveautés de la v2.10](#-nouveautés-de-la-v210)
 - [Fonctionnalités](#-fonctionnalités)
 - [Comment ça fonctionne](#-comment-ça-fonctionne)
 - [Hôte, client et compatibilité](#-hôte-client-et-compatibilité)
@@ -28,13 +28,13 @@ Correctif de crash en ligne et refonte du netcode pour **NARUTO X BORUTO Ultimat
 
 ---
 
-## 🆕 Nouveautés de la v2.9
+## 🆕 Nouveautés de la v2.10
 
-Mise à jour majeure axée sur la **cadence 60,000 Hz exacte** (avec rattrapage de dérive d'horloge `ClockSync` et suppression du judder VSync sur écrans 144/165 Hz), le **bouclier anti-gigue dynamique en plein match**, l'**élimination de nouvelles familles de crashs en ligne** (`ccTaskManager`, VFX `m_pCoord`, presets `SpSkill`, recherche d'ID, `DestroySockets`) et le **durcissement complet des sessions personnalisées**. Le détail complet est dans le [`CHANGELOG`](CHANGELOG.md).
+Mise à jour corrective dédiée à l'élimination d'une nouvelle famille de crashs en ligne du jeu d'origine dans le sous-système **`NetFes`** (événements et statistiques réseau Bandai Namco), tout en conservant l'intégralité des améliorations de la v2.9 (`60,000 Hz` exact, `ClockSync`, écrans 144/165 Hz, bouclier anti-gigue dynamique). Le détail complet est dans le [`CHANGELOG`](CHANGELOG.md).
 
-- **Cadence 60,000 Hz exacte, `ClockSync` & écrans 144/165 Hz** : nouveau `WaitableTimer` haute résolution (`EnablePrecisionFramePacer = 1`), déverrouillage du Cœur CPU 0, synchronisation fine d'horloge entre les deux PC, et contournement automatique du battement VSync en fenêtré / sans bordure sur les moniteurs hors multiples de 60 Hz (`BypassNon60HzVsyncJudder = 1`).
-- **Bouclier anti-gigue en direct & filtre RTT à froid** : passage automatique en protection maximale (`Redundancy = 4`, `Spin = 1600 µs`) lors d'une rafale Wi-Fi en plein round puis retour au calme après 18 s stables, filtrage des pics de ping initiaux du relais Steam SDR, suppression du gel lockstep `checksum == 0`, et propagation `'NM'` du statut `2/2` moddé aux combattants clients en lobby spectateur.
-- **Nouvelle armure anti-crash (`59/59 hooks` + 7 ponts VFX W^X)** : protection contre l'invalidation d'itérateur `ccTaskManager` (`RemoveTask` en cours de parcours), les 7 sites de crash VFX `m_pCoord == NULL`, les presets d'équipe `SpSkill` hors bornes, le mismatch `DestroySockets`, et le crash de fermeture de la recherche d'ID (+ saisie directe des chiffres sur clavier **AZERTY**).
+- **Correction du crash `0xC0000005` à `NSUNSC.exe+0x00B6530B` & de ses 16 callbacks HTTP jumeaux (`NetFes`)** : élimination complète du crash Use-After-Free dans `ccNetEvergreenFesParamManager` et `ccNetFesParamManager` lorsqu'une requête HTTP de statistiques ou d'événement en ligne répond ou expire (`"networkmode_089"` / `"networkmode_1073"`) après la fermeture/réinitialisation du mode réseau ou le nettoyage externe de sa tâche `ccTaskCertainExe` (`"ccNetFesParamManager::Update"`).
+- **Auto-réparation de tâche & prévention de double-free (`64/64 hooks` + 17 gardes de vtables `NetFes`)** : suivi temps réel du cycle de vie des deux gestionnaires `NetFes`, validation croisée du `SimpleCommand` propriétaire (`[pTask + 0x28] -> [pCmd + 0x08] == pMgr`) et substitution automatique d'une tâche sentinelle inerte si la tâche de mise à jour est détruite prématurément par `ccTaskManager::DeleteAllTasks`.
+- **Rappel des nouveautés majeures introduites en v2.9** : pacer haute résolution à `60,000 Hz` exact (`EnablePrecisionFramePacer = 1`), synchronisation fine d'horloge `ClockSync`, suppression du judder VSync fenêtré sur écrans 75/100/144/165 Hz, bouclier anti-gigue dynamique en plein match, armure `ccTaskManager` / VFX `m_pCoord` / presets `SpSkill`, et durcissement des lobbies 8 joueurs.
 - **Sessions & « Merci de patienter » durcis** : chien de garde continu sur l'interface de lobby et `WaitDlgClose` (même sous `BattleState > 0`), fermeture automatique des lobbies « zombies » tombés à 0 membre, purge des cartes fantômes `BattleTable` et compactage strict des 8 slots de session.
 
 ---
@@ -43,7 +43,7 @@ Mise à jour majeure axée sur la **cadence 60,000 Hz exacte** (avec rattrapage 
 
 | # | Fonctionnalité | Effet |
 | :-- | :--- | :--- |
-| 1 | **Correctifs des crashs & blocages en ligne** (`0xC0000005` / `MSG_WaitMoment`) | Supprime les crashs liés aux pseudos Steam (`NSUNSC.exe+0x10BAD24`, `+0x0847A67`), au pool de renvoi (`+0x10F1455`, `+0x10F2928`), au lobby personnalisé (`+0x113D7F2`, dédoublement de slots, déconnexion brutale), à la fenêtre de chat rapide (`+0x0150CC8`) et débloque la fenêtre *« Merci de patienter »* figée en fin de match (`+0x06C1CF0`). |
+| 1 | **Correctifs des crashs & blocages en ligne** (`0xC0000005` / `MSG_WaitMoment`) | Supprime les crashs liés aux pseudos Steam (`NSUNSC.exe+0x10BAD24`, `+0x0847A67`), au pool de renvoi (`+0x10F1455`, `+0x10F2928`), aux événements en ligne `NetFes` (`+0x0B6530B` et ses 16 jumeaux HTTP), au lobby personnalisé (`+0x113D7F2`, dédoublement de slots, déconnexion brutale), à la fenêtre de chat rapide (`+0x0150CC8`) et débloque la fenêtre *« Merci de patienter »* figée en fin de match (`+0x06C1CF0`). |
 | 2 | **Délai d'entrée « aller simple » (OWD)** | Remplace la formule du jeu (`1,25 × ping` complet) par la latence réelle aller simple (`ping / 2`) + une petite marge anti-gigue. Jusqu'à **1 frame (16,7 ms)** entre deux joueurs équipés du mod. |
 | 3 | **Négociation automatique (handshake `NC`)** | Les deux jeux se reconnaissent entre eux et se mettent d'accord sur le même délai. Reste compatible avec les joueurs sans mod. |
 | 4 | **Redondance des paquets UDP** | Chaque paquet contient aussi les 3 frames précédentes : si un paquet se perd, le suivant comble le trou sans gel. |
@@ -75,7 +75,7 @@ Le jeu charge au démarrage la bibliothèque Microsoft `d3dcompiler_47.dll`. Le 
 
 Avant de toucher une fonction du jeu, le mod compare ses premiers octets avec ceux attendus pour la version 1.71 :
 
-- **59 hooks** (1 rendu + 2 timer + 38 crash-fix/session/tâches/presets + 13 netcode + 5 wait-dialog), **9 patchs d'octets**, **1 pont de tri/slot lobby** et **7 ponts VFX W^X**, vérifiés individuellement.
+- **64 hooks** (1 rendu + 2 timer + 43 crash-fix/session/tâches/presets/NetFes + 13 netcode + 5 wait-dialog), **9 patchs d'octets**, **17 gardes de vtables `NetFes`**, **1 pont de tri/slot lobby** et **7 ponts VFX W^X**, vérifiés individuellement.
 - Si les octets ne correspondent pas (autre version du jeu), ce correctif est **ignoré** au lieu de risquer un crash.
 
 ### Le problème du netcode d'origine
@@ -166,7 +166,7 @@ Au lancement, une **console noire** s'ouvre à côté du jeu (désactivable, voi
 
 | Message | Signification |
 | :--- | :--- |
-| `[Init] 59/59 .pdata-verified hooks active.` | Tout est actif. **Moins de 59** = version du jeu différente de 1.71 (ou option désactivée dans le `.ini`). |
+| `[Init] 64/64 .pdata-verified hooks active.` | Tout est actif. **Moins de 64** = version du jeu différente de 1.71 (ou option désactivée dans le `.ini`). |
 | `[LowLatency] DXGI MaxFrameLatency: 3 -> 1 f ...` | Rendu sans file d'attente actif (s'affiche au premier rendu). |
 | `[Scheduler] Gaming Boost active: ...` | Boost du planificateur Windows actif. |
 | `[WiFi-AntiLag] Active on "..."` | Mode Wi-Fi gaming actif (uniquement si vous êtes en Wi-Fi). |
@@ -243,7 +243,7 @@ Ouvrez le fichier avec le Bloc-notes. `1` = activé, `0` = désactivé. **Les va
 ## ⚠️ Précautions & limites
 
 > [!WARNING]
-> **Mises à jour du jeu.** Le mod est conçu pour la **version 1.71**. Après un patch officiel, les correctifs dont le code a changé sont désactivés automatiquement (la console affiche moins de `59/59`). Le jeu reste jouable, mais le mod ne fonctionne plus qu'en partie. Il faudra attendre une nouvelle version du mod.
+> **Mises à jour du jeu.** Le mod est conçu pour la **version 1.71**. Après un patch officiel, les correctifs dont le code a changé sont désactivés automatiquement (la console affiche moins de `64/64`). Le jeu reste jouable, mais le mod ne fonctionne plus qu'en partie. Il faudra attendre une nouvelle version du mod.
 
 - **Steam peut retirer le mod.** « Vérifier l'intégrité des fichiers du jeu » ou une mise à jour peut remplacer `d3dcompiler_47.dll` par l'original. Recopiez alors la DLL du mod.
 - **Antivirus.** La DLL n'est pas signée et modifie le comportement du jeu en mémoire : certains antivirus (dont Windows Defender) peuvent la signaler. Si vous avez un doute, compilez-la vous-même depuis les sources.
@@ -261,7 +261,7 @@ Ouvrez le fichier avec le Bloc-notes. `1` = activé, `0` = désactivé. **Les va
 | Symptôme | Solution |
 | :--- | :--- |
 | Aucune console au lancement | Vérifiez que `d3dcompiler_47.dll` est bien **à côté de `NSUNSC.exe`** et que `EnableConsole = 1`. Sous Proton, ajoutez l'option de lancement `WINEDLLOVERRIDES`. |
-| `X/59 hooks active` avec X < 59 | La version du jeu n'est pas la 1.71 (ou une option de correctif a été désactivée dans `netcode_config.ini`). |
+| `X/64 hooks active` avec X < 64 | La version du jeu n'est pas la 1.71 (ou une option de correctif a été désactivée dans `netcode_config.ini`). |
 | Le jeu ne démarre plus | Supprimez `d3dcompiler_47.dll` et renommez `d3dcompiler_47_original.dll` en `d3dcompiler_47.dll` (ou vérifiez l'intégrité des fichiers sur Steam), puis signalez le problème avec votre `storm_netcode.log`. |
 | Gel au tout début du combat | Remettez `DelayMode = 1` et les valeurs par défaut (supprimez le `.ini` pour qu'il soit régénéré). |
 | Saccades fréquentes en combat | Augmentez `JitterMarginMs` (par ex. `12` ou `16`), ou passez en câble Ethernet. |

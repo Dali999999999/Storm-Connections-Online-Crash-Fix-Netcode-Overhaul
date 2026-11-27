@@ -5,7 +5,7 @@
 #include <intrin.h>
 
 // ============================================================================
-// StormNetcode v2.9 Core Coordinator:
+// StormNetcode v2.10 Core Coordinator:
 //   - Shared State & Function Pointer Definitions (`namespace StormInternal`)
 //   - Module 4:  Battler Micro-Jitter Poll & Paced Dual-Shot FastNACK (`hk_ReceivePackets`)
 //   - Module 4b: Spectator Micro-Jitter Poll, Initial-Load Guard & Paced NACK (`hk_ReceiveWatcherPackets`)
@@ -202,6 +202,11 @@ fnTaskMgrUpdateRange_t         oTaskMgrUpdateRange         = nullptr;
 fnTaskMgrUpdateSinglePar_t     oTaskMgrUpdateSinglePar     = nullptr;
 fnTaskMgrRemoveTask_t          oTaskMgrRemoveTask          = nullptr;
 fnTaskMgrDeleteAllTasks_t      oTaskMgrDeleteAllTasks      = nullptr;
+fnNetFesMgrCtor_t              oEvergreenFesCtor           = nullptr;
+fnNetFesMgrDtor_t              oEvergreenFesDtor           = nullptr;
+fnNetFesMgrCtor_t              oNetFesCtor                 = nullptr;
+fnNetFesMgrDtor_t              oNetFesDtor                 = nullptr;
+fnTaskCertainExeSDtor_t        oTaskCertainExeSDtor        = nullptr;
 
 // ============================================================================
 // 4. Gentle Micro-Jitter Poll & Paced Single-Shot FastNACK Recovery
@@ -740,8 +745,9 @@ void __fastcall hk_CtrlBattleSync(void* pBattleBase) {
             const uint64_t spSkillSvs    = g_Telemetry.spSkillOobSaves.load();
             const uint64_t taskMgrSvs    = g_Telemetry.taskManagerCrashSaves.load();
             const uint64_t vfxCoordSvs   = GetVfxCoordNullSaves();
-            const uint64_t totalCrashSvs = personaSaves + lobbySaves + vkSaves + sessDiscSaves + dupSlotSaves + lobbyWaitSvs + chatTplSvs + spSkillSvs + taskMgrSvs + vfxCoordSvs;
-            LogNetcode("[Telemetry] Frame=%d | RTT=%d ms | Delay=%d f | Pkts=%llu (Aux=%llu) | RedundantFrms=%llu | JitterSaved=%llu | FastNACKs=%llu | Stalls=%llu | CrashSaves=%llu (Persona=%llu, LobbySlot=%llu, VKeyboard=%llu, SessDisc=%llu, DupSlot=%llu, LobbyWait=%llu, ChatTpl=%llu, SpSkill=%llu, TaskMgr=%llu, VfxCoord=%llu)",
+            const uint64_t netFesSvs     = g_Telemetry.netFesCrashSaves.load();
+            const uint64_t totalCrashSvs = personaSaves + lobbySaves + vkSaves + sessDiscSaves + dupSlotSaves + lobbyWaitSvs + chatTplSvs + spSkillSvs + taskMgrSvs + vfxCoordSvs + netFesSvs;
+            LogNetcode("[Telemetry] Frame=%d | RTT=%d ms | Delay=%d f | Pkts=%llu (Aux=%llu) | RedundantFrms=%llu | JitterSaved=%llu | FastNACKs=%llu | Stalls=%llu | CrashSaves=%llu (Persona=%llu, LobbySlot=%llu, VKeyboard=%llu, SessDisc=%llu, DupSlot=%llu, LobbyWait=%llu, ChatTpl=%llu, SpSkill=%llu, TaskMgr=%llu, VfxCoord=%llu, NetFes=%llu)",
                        pSync->m_pInputBuffer ? pSync->m_pInputBuffer->m_currentSyncFrame : -1,
                        g_Telemetry.lastRawRttMs.load(),
                        pSync->m_netDelayFrames,
@@ -761,7 +767,8 @@ void __fastcall hk_CtrlBattleSync(void* pBattleBase) {
                        static_cast<unsigned long long>(chatTplSvs),
                        static_cast<unsigned long long>(spSkillSvs),
                        static_cast<unsigned long long>(taskMgrSvs),
-                       static_cast<unsigned long long>(vfxCoordSvs));
+                       static_cast<unsigned long long>(vfxCoordSvs),
+                       static_cast<unsigned long long>(netFesSvs));
         }
     }
 }
@@ -945,6 +952,11 @@ void InitializeNetcodeHooks() {
     static constexpr uint8_t kPrologue_TaskMgrUpdateSingle[]  = { 0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0xF2, 0x41, 0x8B };
     static constexpr uint8_t kPrologue_TaskMgrRemoveTask[]    = { 0x48, 0x85, 0xD2, 0x0F, 0x84, 0xEE, 0x00, 0x00, 0x00, 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89 };
     static constexpr uint8_t kPrologue_TaskMgrDeleteAll[]     = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57 };
+    static constexpr uint8_t kPrologue_EvergreenFesCtor[]     = { 0x48, 0x89, 0x5C, 0x24, 0x20, 0x48, 0x89, 0x4C, 0x24, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41 };
+    static constexpr uint8_t kPrologue_EvergreenFesDtor[]     = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48 };
+    static constexpr uint8_t kPrologue_NetFesCtor[]           = { 0x48, 0x89, 0x4C, 0x24, 0x08, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x30, 0x48 };
+    static constexpr uint8_t kPrologue_NetFesDtor[]           = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48 };
+    static constexpr uint8_t kPrologue_TaskCertainExeSDtor[]  = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0xDA, 0x48, 0x8B, 0xF9 };
 
     static constexpr uint8_t kPrologue_CtrlBattleSync[]       = { 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x30 };
     static constexpr uint8_t kPrologue_CalcNetFrame[]         = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20 };
@@ -1034,6 +1046,11 @@ void InitializeNetcodeHooks() {
             { "ccTaskManager::UpdateSinglePar (+0x10D6AA0)", StormRva::kTaskMgr_UpdateSingleParallel,   kPrologue_TaskMgrUpdateSingle, sizeof(kPrologue_TaskMgrUpdateSingle), reinterpret_cast<LPVOID>(&hk_TaskMgrUpdateSingleParallel),   reinterpret_cast<LPVOID*>(&oTaskMgrUpdateSinglePar) },
             { "ccTaskManager::RemoveTask (+0x10D6FE0)",      StormRva::kTaskMgr_RemoveTask,             kPrologue_TaskMgrRemoveTask,   sizeof(kPrologue_TaskMgrRemoveTask),   reinterpret_cast<LPVOID>(&hk_TaskMgrRemoveTask),             reinterpret_cast<LPVOID*>(&oTaskMgrRemoveTask) },
             { "ccTaskManager::DeleteAllTasks (+0x10D70E0)",  StormRva::kTaskMgr_DeleteAllTasks,         kPrologue_TaskMgrDeleteAll,    sizeof(kPrologue_TaskMgrDeleteAll),    reinterpret_cast<LPVOID>(&hk_TaskMgrDeleteAllTasks),         reinterpret_cast<LPVOID*>(&oTaskMgrDeleteAllTasks) },
+            { "EvergreenFes::ctor (+0x0B64080)",             StormRva::kEvergreenFes_Ctor,              kPrologue_EvergreenFesCtor,    sizeof(kPrologue_EvergreenFesCtor),    reinterpret_cast<LPVOID>(&hk_EvergreenFesCtor),              reinterpret_cast<LPVOID*>(&oEvergreenFesCtor) },
+            { "EvergreenFes::~dtor (+0x0B64C40)",            StormRva::kEvergreenFes_Dtor,              kPrologue_EvergreenFesDtor,    sizeof(kPrologue_EvergreenFesDtor),    reinterpret_cast<LPVOID>(&hk_EvergreenFesDtor),              reinterpret_cast<LPVOID*>(&oEvergreenFesDtor) },
+            { "NetFes::ctor (+0x0B6DE00)",                   StormRva::kNetFes_Ctor,                    kPrologue_NetFesCtor,          sizeof(kPrologue_NetFesCtor),          reinterpret_cast<LPVOID>(&hk_NetFesCtor),                    reinterpret_cast<LPVOID*>(&oNetFesCtor) },
+            { "NetFes::~dtor (+0x0B6E420)",                  StormRva::kNetFes_Dtor,                    kPrologue_NetFesDtor,          sizeof(kPrologue_NetFesDtor),          reinterpret_cast<LPVOID>(&hk_NetFesDtor),                    reinterpret_cast<LPVOID*>(&oNetFesDtor) },
+            { "ccTaskCertainExe::sdtor (+0x0B6530B)",        StormRva::kTaskCertainExe_SDtor,           kPrologue_TaskCertainExeSDtor, sizeof(kPrologue_TaskCertainExeSDtor), reinterpret_cast<LPVOID>(&hk_TaskCertainExeSDtor),           reinterpret_cast<LPVOID*>(&oTaskCertainExeSDtor) },
         };
         expectedCount += static_cast<int>(std::size(crashFixHooks));
         for (const auto& h : crashFixHooks) {
@@ -1081,6 +1098,7 @@ void ShutdownNetcodeHooks(bool processTerminating) {
     if (!processTerminating) {
         MH_DisableHook(MH_ALL_HOOKS);
         MH_Uninitialize();
+        RemoveNetFesLambdaVtableGuards();
         RemoveVfxCoordNullFixBridges();
         RemoveLobbySlotNullFixBridge();
         RestoreVerifiedBytePatches();

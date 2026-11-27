@@ -2,6 +2,28 @@
 
 Toutes les évolutions notables de ce projet sont documentées ici.
 
+## [2.10] - 2026-11-27
+
+**Jeu requis : NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS — version 1.71 (Steam, Windows x64).**
+
+Mise à jour ciblée corrigeant un nouveau crash en ligne du jeu d'origine (`0xC0000005` à `NSUNSC.exe+0x00B6530B`) découvert grâce aux retours de la communauté, ainsi que toute sa famille de callbacks réseau asynchrones dans le module d'événements en ligne (`NetFes`). **100 % rétrocompatible sur le réseau avec la v2.9.**
+
+### Nouveau correctif de crash en ligne : sous-système `NetFes` (`NSUNSC.exe+0x00B6530B` & 16 callbacks jumeaux)
+- **Cause du bug d'origine identifiée (`NetFes\ccNetEvergreenFesParamManager.cpp` & `ccNetFesParamManager.cpp`)** :
+  - Lors de la connexion au mode en ligne ou de la synchronisation des événements/statistiques, le jeu envoie des requêtes HTTP asynchrones vers les serveurs Bandai Namco (`+0x0BB7BF0`) en enregistrant **17 callbacks `std::_Func_impl_no_alloc`** qui capturent uniquement un pointeur `this` brut (`[pFuncImpl + 0x08]`), sans `weak_ptr` ni annulation à la destruction.
+  - Si une réponse tardive ou un timeout réseau (`"networkmode_089"` / `"networkmode_1073"`) survient alors que le mode réseau a été quitté/réinitialisé (`ccDataSet` `+0x05B61AF` / `+0x05B61CC`) ou que la tâche `ccTaskCertainExe` (`"ccNetFesParamManager::Update"`) a été purgée par `ccTaskManager::DeleteAllTasks` (`+0x10D70E0`), le jeu déréférence un pointeur libéré sur `call qword ptr [rax + 0x20]` (`NSUNSC.exe+0x00B6530B`) et provoque un crash immédiat au bureau (`0xC0000005`).
+- **Armure complète en 3 niveaux (`64/64 hooks` + 17 gardes de vtables `.rdata` W^X)** :
+  - **Suivi du cycle de vie (`+0x0B64080` / `+0x0B64C40` et `+0x0B6DE00` / `+0x0B6E420`)** : registre thread-safe (`SRWLOCK`) des instances vivantes de `ccNetEvergreenFesParamManager` et `ccNetFesParamManager` + anneau d'exclusion des gestionnaires détruits, avec assainissement préventif de `m_pUpdateTask` dans le destructeur pour éliminer tout risque de double-free (`+0x0B64C7B` / `+0x0B6E45B`).
+  - **Protection W^X sur les 17 vtables `.rdata` (`+0x19987E0..+0x19989A0` et `+0x19995B8..+0x1999740`)** : interception individuelle de `_Do_call` (`slot[2]`) sur les 9 lambdas `EvergreenFes` et les 8 lambdas `NetFes` afin de vérifier la vtable RTTI vivante du gestionnaire et d'ignorer proprement tout callback HTTP orphelin.
+  - **Auto-réparation immédiate de `m_pUpdateTask` (`ccTaskCertainExe::sdtor` à `+0x00B57B0`)** : vérification croisée du `SimpleCommand` propriétaire (`[pTask + 0x28] -> [pCmd + 0x08] == pMgr`, insensible à la réutilisation d'adresse mémoire sur le tas `0x30`) et remplacement instantané de `[mgr + 0xB8]` / `[mgr + 0x88]` par une tâche sentinelle inerte (`s_InertFesTask`) en cas de suppression externe — protégeant aussi toutes les méthodes synchrones du module `NetFes`.
+- **Télémétrie & intégrité binaire** :
+  - Ajout du compteur `NetFes` dans le rapport périodique `[Telemetry]` (`storm_netcode.log`).
+  - **64/64 hooks vérifiés via `.pdata`**, **17 gardes de vtables `NetFes`**, **9 patchs d'octets**, **1 pont de lobby** et **7 ponts VFX W^X**, compilés sans aucun avertissement sous MSVC `/W4 /permissive-`.
+
+### Mise à jour depuis la v2.9 (ou antérieure)
+1. Remplacez `d3dcompiler_47.dll` (et `netcode_config.ini` si vous souhaitez les commentaires à jour) dans le dossier du jeu à côté de `NSUNSC.exe`.
+2. Au lancement, la console doit afficher **`v2.10`** et **`[Init] 64/64 .pdata-verified hooks active.`**
+
 ## [2.9] - 2026-11-26
 
 **Jeu requis : NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS — version 1.71 (Steam, Windows x64).**

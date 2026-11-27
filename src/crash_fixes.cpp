@@ -2337,6 +2337,7 @@ void ApplyCrashAndNetcodeBytePatches(bool applyCrashPatches, bool applyNetcodePa
         ApplyVerifiedBytePatch(g_EnginePatches[8]); // ccStateChatWindow exit3 teardown order fix (+0x016AAE1)
         InstallLobbySlotNullFixBridge();            // LobbySlotNullFix bridge (+0x113D7E6) & State1SortFix (+0x113D736)
         InstallVfxCoordNullFixBridges();            // VFX m_pCoord TOCTOU null-deref guards (+0x132C99B + 6 twins)
+        InstallNetFesLambdaVtableGuards();          // NetFes async HTTP lambda UAF & m_pUpdateTask guards (+0x0B6530B + 16 twins)
     }
     if (applyNetcodePatches) {
         ApplyVerifiedBytePatch(g_EnginePatches[2]); // ReceivePackets multi-record lookahead fix
@@ -3150,6 +3151,544 @@ void __fastcall hk_TaskMgrDeleteAllTasks(void* pMgr) {
     ReapTombstonedTaskNodesLocked(pMgr);
     oTaskMgrDeleteAllTasks(pMgr);
     UnlockTaskMgrCs(pMgr, locked);
+}
+
+// ============================================================================
+// NetFes (ccNetEvergreenFesParamManager & ccNetFesParamManager) Async Callback
+// & ccTaskCertainExe ("ccNetFesParamManager::Update") UAF Armor
+//
+// Fixes deterministic 0xC0000005 @ NSUNSC.exe+0x00B6530B (`call qword ptr [rax + 0x20]`)
+// and all 16 twin std::_Func_impl_no_alloc HTTP stats callbacks in NetFes:
+//   1) All 9 ccNetEvergreenFesParamManager lambdas (.rdata +0x19987E0..+0x19989A0) and
+//      8 ccNetFesParamManager lambdas (.rdata +0x19995B8..+0x1999740) capture only a raw
+//      `this` pointer at `[pFuncImpl + 0x08]` with no cancellation or weak_ptr. When
+//      ccDataSet tears down/recreates the manager (+0x05B61AF / +0x05B61CC) while a Bandai
+//      Namco stats request (+0x0BB7BF0) is in flight or timing out ("networkmode_089" /
+//      "networkmode_1073"), `_Do_call` writes into freed memory and dereferences `m_pUpdateTask`.
+//   2) If `ccTaskManager::DeleteAllTasks` (+0x10D70E0) or external cleanup destroys the
+//      0x30-byte `ccTaskCertainExe` ("ccNetFesParamManager::Update", vtable +0x1761A08)
+//      via `vtable[0]` (+0x00B57B0) while the manager is still alive, `[mgr + 0xB8]`
+//      (EvergreenFes) / `[mgr + 0x88]` (Fes) is left pointing to a freed nuccHeap block
+//      whose `[rcx]` vtable word is 0 -> `mov rax, [rcx]` loads 0, and `call [rax + 0x20]`
+//      faults at +0x00B6530B (and causes a later double-free in ~dtor +0x0B64C7B / +0x0B6E45B).
+// ============================================================================
+
+namespace {
+
+constexpr size_t kEvergreenFesSize       = 0x5D0;
+constexpr size_t kEvergreenFesTaskOffset = 0x0B8;
+constexpr size_t kNetFesSize             = 0x4D0;
+constexpr size_t kNetFesTaskOffset       = 0x088;
+
+struct alignas(16) InertFesTask {
+    uintptr_t vtable;     // +0x00
+    uint8_t   pad08[16];  // +0x08..+0x17
+    uint32_t  priority;   // +0x18 (0x42)
+    uint32_t  pauseBits;  // +0x1C
+    int32_t   activeFlag; // +0x20 (written by vtable[4] SetActive)
+    uint32_t  pad24;      // +0x24
+    uintptr_t pCommand;   // +0x28
+};
+static_assert(sizeof(InertFesTask) == 0x30, "InertFesTask must match 0x30-byte ccTaskCertainExe");
+static_assert(offsetof(InertFesTask, activeFlag) == 0x20, "InertFesTask::activeFlag offset mismatch");
+
+extern InertFesTask s_InertFesTask;
+
+void* __fastcall InertFesTaskNoOpScalarDtor(void* pThis, uint32_t) noexcept {
+    return pThis;
+}
+
+uintptr_t __fastcall InertFesTaskNoOp(void*) noexcept {
+    return 0;
+}
+
+void __fastcall InertFesTaskNoOpExec(void*, uint32_t) noexcept {}
+
+void __fastcall InertFesTaskSetActive(void* pTask, int32_t active) noexcept {
+    if (pTask == &s_InertFesTask) {
+        s_InertFesTask.activeFlag = active;
+    }
+}
+
+const uintptr_t kInertFesTaskVtable[6] = {
+    reinterpret_cast<uintptr_t>(&InertFesTaskNoOpScalarDtor), // +0x00: scalar deleting dtor
+    reinterpret_cast<uintptr_t>(&InertFesTaskNoOp),           // +0x08
+    reinterpret_cast<uintptr_t>(&InertFesTaskNoOp),           // +0x10
+    reinterpret_cast<uintptr_t>(&InertFesTaskNoOpExec),       // +0x18: Exec
+    reinterpret_cast<uintptr_t>(&InertFesTaskSetActive),      // +0x20: SetActive(int32_t)
+    reinterpret_cast<uintptr_t>(&InertFesTaskNoOp),           // +0x28
+};
+
+InertFesTask s_InertFesTask = {
+    reinterpret_cast<uintptr_t>(kInertFesTaskVtable),
+    { 0 },
+    0x42u,
+    0u,
+    0,
+    0u,
+    0ULL
+};
+
+struct LiveNetFesEntry {
+    void* mgr         = nullptr;
+    void* task        = nullptr;
+    bool  isEvergreen = false;
+};
+
+constexpr size_t kMaxTrackedNetFesMgrs   = 16;
+constexpr size_t kDestroyedNetFesRingCap = 32;
+
+SRWLOCK         s_NetFesLock                                 = SRWLOCK_INIT;
+LiveNetFesEntry s_LiveNetFesMgrs[kMaxTrackedNetFesMgrs]      = {};
+void*           s_DestroyedNetFesRing[kDestroyedNetFesRingCap] = {};
+size_t          s_DestroyedNetFesHead                        = 0;
+thread_local void* t_IntentionalDtorFesTask                  = nullptr;
+
+void ReadMgrTaskPtrSeh(void* pMgr, size_t taskOffset, void** ppOutTask) noexcept {
+    *ppOutTask = nullptr;
+    if (reinterpret_cast<uintptr_t>(pMgr) < kMinValidPtr) return;
+    __try {
+        *ppOutTask = *reinterpret_cast<void* const*>(static_cast<const uint8_t*>(pMgr) + taskOffset);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *ppOutTask = nullptr;
+    }
+}
+
+bool WriteMgrTaskPtrSeh(void* pMgr, size_t taskOffset, void* newTask) noexcept {
+    if (reinterpret_cast<uintptr_t>(pMgr) < kMinValidPtr) return false;
+    __try {
+        *reinterpret_cast<void**>(static_cast<uint8_t*>(pMgr) + taskOffset) = newTask;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void RegisterLiveNetFesMgr(void* pMgr, bool isEvergreen) noexcept {
+    if (reinterpret_cast<uintptr_t>(pMgr) < kMinValidPtr) return;
+    const size_t taskOffset = isEvergreen ? kEvergreenFesTaskOffset : kNetFesTaskOffset;
+    void* pTask = nullptr;
+    ReadMgrTaskPtrSeh(pMgr, taskOffset, &pTask);
+    if (!pTask) {
+        WriteMgrTaskPtrSeh(pMgr, taskOffset, &s_InertFesTask);
+        pTask = &s_InertFesTask;
+    }
+
+    AcquireSRWLockExclusive(&s_NetFesLock);
+    for (size_t i = 0; i < kDestroyedNetFesRingCap; ++i) {
+        if (s_DestroyedNetFesRing[i] == pMgr) {
+            s_DestroyedNetFesRing[i] = nullptr;
+        }
+    }
+    size_t freeIdx = kMaxTrackedNetFesMgrs;
+    for (size_t i = 0; i < kMaxTrackedNetFesMgrs; ++i) {
+        if (s_LiveNetFesMgrs[i].mgr == pMgr) {
+            s_LiveNetFesMgrs[i].task        = pTask;
+            s_LiveNetFesMgrs[i].isEvergreen = isEvergreen;
+            ReleaseSRWLockExclusive(&s_NetFesLock);
+            return;
+        }
+        if (!s_LiveNetFesMgrs[i].mgr && freeIdx == kMaxTrackedNetFesMgrs) {
+            freeIdx = i;
+        }
+    }
+    if (freeIdx < kMaxTrackedNetFesMgrs) {
+        s_LiveNetFesMgrs[freeIdx].mgr         = pMgr;
+        s_LiveNetFesMgrs[freeIdx].task        = pTask;
+        s_LiveNetFesMgrs[freeIdx].isEvergreen = isEvergreen;
+    }
+    ReleaseSRWLockExclusive(&s_NetFesLock);
+}
+
+// Verifies both ccTaskCertainExe vtable (+0x1761A08) AND SimpleCommand back-pointer ([pTask+0x28]->[pCmd+0x08] == pMgr)
+// so a freed 0x30-byte block reallocated to an unrelated ccTaskCertainExe is never mistaken for pMgr's task.
+bool IsRealOwnedNetFesTaskSeh(void* pTask, void* pExpectedMgr) noexcept {
+    if (!g_BaseAddress) return false;
+    const uintptr_t taskAddr = reinterpret_cast<uintptr_t>(pTask);
+    if (taskAddr < kMinValidPtr || taskAddr > kMaxValidUserPtr - 0x30) {
+        return false;
+    }
+    const uintptr_t expectedTaskVtbl = g_BaseAddress + StormRva::kVtbl_TaskCertainExe;
+    __try {
+        if (*reinterpret_cast<const volatile uintptr_t*>(taskAddr) != expectedTaskVtbl) {
+            return false;
+        }
+        const uintptr_t cmdAddr = *reinterpret_cast<const volatile uintptr_t*>(taskAddr + 0x28);
+        if (cmdAddr < kMinValidPtr || cmdAddr > kMaxValidUserPtr - 0x18) {
+            return false;
+        }
+        return (*reinterpret_cast<void* const volatile*>(cmdAddr + 0x08) == pExpectedMgr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool IsDestroyedNetFesMgr(void* pMgr) noexcept;
+
+// Fallback for pre-MinHook boot instances: inspects [pTask + 0x28] -> [pCmd + 0x08] to see if pTask
+// belongs to a live ccNetEvergreenFesParamManager / ccNetFesParamManager not yet in s_LiveNetFesMgrs.
+bool TryHealPreHookNetFesTaskOwnerSeh(void* pTask, void** ppOutHealedMgr, bool* pOutIsEvergreen) noexcept {
+    *ppOutHealedMgr  = nullptr;
+    *pOutIsEvergreen = false;
+    if (!g_BaseAddress) return false;
+    const uintptr_t taskAddr = reinterpret_cast<uintptr_t>(pTask);
+    if (taskAddr < kMinValidPtr || taskAddr > kMaxValidUserPtr - 0x30) {
+        return false;
+    }
+    const uintptr_t evergreenVtbl = g_BaseAddress + StormRva::kVtbl_EvergreenFesParamMgr;
+    const uintptr_t netFesVtbl    = g_BaseAddress + StormRva::kVtbl_NetFesParamMgr;
+    __try {
+        const uintptr_t cmdAddr = *reinterpret_cast<const volatile uintptr_t*>(taskAddr + 0x28);
+        if (cmdAddr < kMinValidPtr || cmdAddr > kMaxValidUserPtr - 0x18) {
+            return false;
+        }
+        void* pOwner = *reinterpret_cast<void* const volatile*>(cmdAddr + 0x08);
+        const uintptr_t ownerAddr = reinterpret_cast<uintptr_t>(pOwner);
+        if (ownerAddr < kMinValidPtr || ownerAddr > kMaxValidUserPtr - kEvergreenFesSize) {
+            return false;
+        }
+        const uintptr_t ownerVtbl = *reinterpret_cast<const volatile uintptr_t*>(ownerAddr);
+        size_t taskOff = 0;
+        bool   evergrn = false;
+        if (ownerVtbl == evergreenVtbl) {
+            taskOff = kEvergreenFesTaskOffset;
+            evergrn = true;
+        } else if (ownerVtbl == netFesVtbl) {
+            taskOff = kNetFesTaskOffset;
+            evergrn = false;
+        } else {
+            return false;
+        }
+        if (IsDestroyedNetFesMgr(pOwner)) {
+            return false;
+        }
+        if (*reinterpret_cast<void* const volatile*>(ownerAddr + taskOff) != pTask) {
+            return false;
+        }
+        *reinterpret_cast<void**>(ownerAddr + taskOff) = &s_InertFesTask;
+        *ppOutHealedMgr  = pOwner;
+        *pOutIsEvergreen = evergrn;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Sanitizes `[pMgr + taskOffset]` prior to ~dtor so an already-freed / sentinel task is never double-freed.
+void* UnregisterNetFesMgrAndSanitizeTask(void* pMgr, bool isEvergreen) noexcept {
+    if (reinterpret_cast<uintptr_t>(pMgr) < kMinValidPtr) return nullptr;
+    const size_t taskOffset = isEvergreen ? kEvergreenFesTaskOffset : kNetFesTaskOffset;
+
+    AcquireSRWLockExclusive(&s_NetFesLock);
+    for (size_t i = 0; i < kMaxTrackedNetFesMgrs; ++i) {
+        if (s_LiveNetFesMgrs[i].mgr == pMgr) {
+            s_LiveNetFesMgrs[i] = {};
+        }
+    }
+    s_DestroyedNetFesRing[s_DestroyedNetFesHead] = pMgr;
+    s_DestroyedNetFesHead = (s_DestroyedNetFesHead + 1) % kDestroyedNetFesRingCap;
+    ReleaseSRWLockExclusive(&s_NetFesLock);
+
+    void* pTask = nullptr;
+    ReadMgrTaskPtrSeh(pMgr, taskOffset, &pTask);
+    if (!pTask) return nullptr;
+
+    if (pTask == &s_InertFesTask) {
+        WriteMgrTaskPtrSeh(pMgr, taskOffset, nullptr);
+        return nullptr;
+    }
+
+    if (!IsRealOwnedNetFesTaskSeh(pTask, pMgr)) {
+        WriteMgrTaskPtrSeh(pMgr, taskOffset, nullptr);
+        const uint64_t saveNum = g_Telemetry.netFesCrashSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (saveNum <= 16) {
+            LogNetcode("[CrashFix] Prevented 0xC0000005 / double-free in ~%s! Scrubbed invalid m_pUpdateTask=0x%llX on mgr=0x%llX.",
+                       isEvergreen ? "ccNetEvergreenFesParamManager" : "ccNetFesParamManager",
+                       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pTask)),
+                       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pMgr)));
+        }
+        return nullptr;
+    }
+    return pTask;
+}
+
+bool IsDestroyedNetFesMgr(void* pMgr) noexcept {
+    bool destroyed = false;
+    AcquireSRWLockShared(&s_NetFesLock);
+    for (size_t i = 0; i < kDestroyedNetFesRingCap; ++i) {
+        if (s_DestroyedNetFesRing[i] == pMgr) {
+            destroyed = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&s_NetFesLock);
+    return destroyed;
+}
+
+// Returns:
+//   0 = pMgr is dead/corrupt (abort callback!)
+//   1 = pMgr & m_pUpdateTask are valid
+//   2 = pMgr is alive, but m_pUpdateTask was NULL/freed/corrupt and was healed to &s_InertFesTask!
+int ValidateAndHealNetFesCallbackSeh(
+    void*       pFuncImpl,
+    const void* pErr,
+    bool        isEvergreen,
+    void**      ppOutMgr,
+    void**      ppOutBadTask) noexcept {
+    *ppOutMgr     = nullptr;
+    *ppOutBadTask = nullptr;
+    const uintptr_t fnAddr  = reinterpret_cast<uintptr_t>(pFuncImpl);
+    const uintptr_t errAddr = reinterpret_cast<uintptr_t>(pErr);
+    if (!g_BaseAddress || fnAddr < kMinValidPtr || fnAddr > kMaxValidUserPtr ||
+        errAddr < kMinValidPtr || errAddr > kMaxValidUserPtr) {
+        return 0;
+    }
+
+    const uintptr_t expectedMgrVtbl = g_BaseAddress +
+        (isEvergreen ? StormRva::kVtbl_EvergreenFesParamMgr : StormRva::kVtbl_NetFesParamMgr);
+    const size_t    mgrSize          = isEvergreen ? kEvergreenFesSize : kNetFesSize;
+    const size_t    taskOffset       = isEvergreen ? kEvergreenFesTaskOffset : kNetFesTaskOffset;
+
+    __try {
+        (void)*reinterpret_cast<const volatile int32_t*>(pErr);
+        void* pMgr = *reinterpret_cast<void* const*>(static_cast<const uint8_t*>(pFuncImpl) + 0x08);
+        *ppOutMgr = pMgr;
+        const uintptr_t mgrAddr = reinterpret_cast<uintptr_t>(pMgr);
+        if (mgrAddr < kMinValidPtr || mgrAddr > kMaxValidUserPtr - mgrSize) {
+            return 0;
+        }
+        // Probe start and end of manager + verify live RTTI vtable
+        const uintptr_t actualMgrVtbl = *reinterpret_cast<const volatile uintptr_t*>(mgrAddr);
+        (void)*reinterpret_cast<const volatile uint8_t*>(mgrAddr + mgrSize - 1);
+        if (actualMgrVtbl != expectedMgrVtbl) {
+            return 0;
+        }
+
+        void* pTask = *reinterpret_cast<void* const*>(mgrAddr + taskOffset);
+        const bool taskOk = (pTask == &s_InertFesTask) || IsRealOwnedNetFesTaskSeh(pTask, pMgr);
+        if (!taskOk) {
+            *ppOutBadTask = pTask;
+            *reinterpret_cast<void**>(mgrAddr + taskOffset) = &s_InertFesTask;
+            return 2;
+        }
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+using fnNetFesLambdaDoCall_t = void(__fastcall*)(void* pFuncImpl, const void* pErr, const void* pPayload);
+
+struct NetFesLambdaVtableSpec {
+    const char* name;
+    uintptr_t   vtableRva;
+    uintptr_t   expectedDoCallRva;
+    bool        isEvergreen;
+    fnNetFesLambdaDoCall_t origDoCall;
+    bool        applied;
+};
+
+NetFesLambdaVtableSpec g_NetFesLambdaSpecs[17] = {
+    // ccNetEvergreenFesParamManager (9 std::_Func_impl_no_alloc vtables)
+    { "EvergreenFes::Lambda0_StatsErr",              0x019987E0, 0x00B6BAC0, true,  nullptr, false },
+    { "EvergreenFes::Lambda1_Achievement (+0xB654D3)",0x01998818, 0x00B6B9E0, true,  nullptr, false },
+    { "EvergreenFes::Lambda2_FesInfoVec (+0xB65894)", 0x01998850, 0x00B6B9F0, true,  nullptr, false },
+    { "EvergreenFes::Lambda3_UserFesInfoA",          0x01998888, 0x00B6BB70, true,  nullptr, false },
+    { "EvergreenFes::Lambda4_UserFesInfoB (+0xB6530B)",0x019988C0, 0x00B6B9D0, true,  nullptr, false },
+    { "EvergreenFes::Lambda5_FesResultA",            0x019988F8, 0x00B6B730, true,  nullptr, false },
+    { "EvergreenFes::Lambda6_FesResultB",            0x01998930, 0x00B6B5F0, true,  nullptr, false },
+    { "EvergreenFes::Lambda7_StatsErrB",             0x01998968, 0x00B6B8A0, true,  nullptr, false },
+    { "EvergreenFes::Lambda8_StatsErrC (+0xB6BA3D)", 0x019989A0, 0x00B6BA00, true,  nullptr, false },
+    // ccNetFesParamManager (8 std::_Func_impl_no_alloc vtables)
+    { "NetFes::Lambda0_FesInfoVec",                  0x019995B8, 0x00B756F0, false, nullptr, false },
+    { "NetFes::Lambda1_StatsErrA (+0xB75487)",       0x019995F0, 0x00B75450, false, nullptr, false },
+    { "NetFes::Lambda2_UserFesInfoA (+0xB759C7)",    0x01999628, 0x00B75990, false, nullptr, false },
+    { "NetFes::Lambda3_UserFesInfoB",                0x01999660, 0x00B75700, false, nullptr, false },
+    { "NetFes::Lambda4_StatsErrB (+0xB75540)",       0x01999698, 0x00B75500, false, nullptr, false },
+    { "NetFes::Lambda5_Achievement (+0xB6EC85)",     0x019996D0, 0x00B75A40, false, nullptr, false },
+    { "NetFes::Lambda6_StatsErrC (+0xB75667)",       0x01999708, 0x00B75630, false, nullptr, false },
+    { "NetFes::Lambda7_FesResult",                   0x01999740, 0x00B75860, false, nullptr, false },
+};
+
+void DispatchNetFesLambdaSafe(size_t idx, void* pFuncImpl, const void* pErr, const void* pPayload) noexcept {
+    const auto& spec = g_NetFesLambdaSpecs[idx];
+    if (!spec.origDoCall) return;
+
+    void* pMgr     = nullptr;
+    void* pBadTask = nullptr;
+    const int st = ValidateAndHealNetFesCallbackSeh(pFuncImpl, pErr, spec.isEvergreen, &pMgr, &pBadTask);
+    if (st == 0 || IsDestroyedNetFesMgr(pMgr)) {
+        const uint64_t saveNum = g_Telemetry.netFesCrashSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (saveNum <= 16) {
+            LogNetcode("[CrashFix] Prevented 0xC0000005 UAF in %s! Dropped orphan HTTP stats callback on destroyed/invalid manager=0x%llX.",
+                       spec.name, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pMgr)));
+        }
+        return;
+    }
+
+    if (st == 2) {
+        const uint64_t saveNum = g_Telemetry.netFesCrashSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (saveNum <= 16) {
+            LogNetcode("[CrashFix] Prevented 0xC0000005 in %s! Healed freed/NULL m_pUpdateTask=0x%llX on live manager=0x%llX.",
+                       spec.name,
+                       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pBadTask)),
+                       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pMgr)));
+        }
+    }
+
+    __try {
+        spec.origDoCall(pFuncImpl, pErr, pPayload);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        const uint64_t saveNum = g_Telemetry.netFesCrashSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (saveNum <= 16) {
+            LogNetcode("[CrashFix] Caught exception inside %s (mgr=0x%llX) — crash prevented.",
+                       spec.name, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pMgr)));
+        }
+    }
+}
+
+template <size_t Idx>
+void __fastcall hk_NetFesLambdaDoCall(void* pFuncImpl, const void* pErr, const void* pPayload) {
+    DispatchNetFesLambdaSafe(Idx, pFuncImpl, pErr, pPayload);
+}
+
+const fnNetFesLambdaDoCall_t kNetFesLambdaDetours[17] = {
+    &hk_NetFesLambdaDoCall<0>,  &hk_NetFesLambdaDoCall<1>,  &hk_NetFesLambdaDoCall<2>,  &hk_NetFesLambdaDoCall<3>,
+    &hk_NetFesLambdaDoCall<4>,  &hk_NetFesLambdaDoCall<5>,  &hk_NetFesLambdaDoCall<6>,  &hk_NetFesLambdaDoCall<7>,
+    &hk_NetFesLambdaDoCall<8>,  &hk_NetFesLambdaDoCall<9>,  &hk_NetFesLambdaDoCall<10>, &hk_NetFesLambdaDoCall<11>,
+    &hk_NetFesLambdaDoCall<12>, &hk_NetFesLambdaDoCall<13>, &hk_NetFesLambdaDoCall<14>, &hk_NetFesLambdaDoCall<15>,
+    &hk_NetFesLambdaDoCall<16>,
+};
+
+} // namespace
+
+void* __fastcall hk_EvergreenFesCtor(void* pThis) {
+    if (!oEvergreenFesCtor) return pThis;
+    void* res = oEvergreenFesCtor(pThis);
+    if (res) {
+        RegisterLiveNetFesMgr(res, true);
+    }
+    return res;
+}
+
+void __fastcall hk_EvergreenFesDtor(void* pThis) {
+    if (!oEvergreenFesDtor) return;
+    void* validTask = UnregisterNetFesMgrAndSanitizeTask(pThis, true);
+    void* prevIntentional = t_IntentionalDtorFesTask;
+    t_IntentionalDtorFesTask = validTask;
+    oEvergreenFesDtor(pThis);
+    t_IntentionalDtorFesTask = prevIntentional;
+}
+
+void* __fastcall hk_NetFesCtor(void* pThis) {
+    if (!oNetFesCtor) return pThis;
+    void* res = oNetFesCtor(pThis);
+    if (res) {
+        RegisterLiveNetFesMgr(res, false);
+    }
+    return res;
+}
+
+void __fastcall hk_NetFesDtor(void* pThis) {
+    if (!oNetFesDtor) return;
+    void* validTask = UnregisterNetFesMgrAndSanitizeTask(pThis, false);
+    void* prevIntentional = t_IntentionalDtorFesTask;
+    t_IntentionalDtorFesTask = validTask;
+    oNetFesDtor(pThis);
+    t_IntentionalDtorFesTask = prevIntentional;
+}
+
+void* __fastcall hk_TaskCertainExeSDtor(void* pTask, uint32_t flags) {
+    if (pTask == &s_InertFesTask) {
+        return pTask;
+    }
+    if (!oTaskCertainExeSDtor || reinterpret_cast<uintptr_t>(pTask) < kMinValidPtr) {
+        return pTask;
+    }
+
+    if (pTask != t_IntentionalDtorFesTask) {
+        void*  healedMgr   = nullptr;
+        bool   isEvergreen = false;
+        AcquireSRWLockExclusive(&s_NetFesLock);
+        for (size_t i = 0; i < kMaxTrackedNetFesMgrs; ++i) {
+            if (s_LiveNetFesMgrs[i].mgr && s_LiveNetFesMgrs[i].task == pTask) {
+                healedMgr                = s_LiveNetFesMgrs[i].mgr;
+                isEvergreen              = s_LiveNetFesMgrs[i].isEvergreen;
+                s_LiveNetFesMgrs[i].task = &s_InertFesTask;
+                const size_t off         = isEvergreen ? kEvergreenFesTaskOffset : kNetFesTaskOffset;
+                WriteMgrTaskPtrSeh(healedMgr, off, &s_InertFesTask);
+            }
+        }
+        ReleaseSRWLockExclusive(&s_NetFesLock);
+
+        if (!healedMgr) {
+            TryHealPreHookNetFesTaskOwnerSeh(pTask, &healedMgr, &isEvergreen);
+        }
+
+        if (healedMgr) {
+            const uint64_t saveNum = g_Telemetry.netFesCrashSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (saveNum <= 16) {
+                LogNetcode("[CrashFix] Healed dangling %s::m_pUpdateTask (task=0x%llX -> InertTask on live mgr=0x%llX) before external deletion (+0x0B6530B crash prevented)!",
+                           isEvergreen ? "ccNetEvergreenFesParamManager" : "ccNetFesParamManager",
+                           static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pTask)),
+                           static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(healedMgr)));
+            }
+        }
+    }
+
+    return oTaskCertainExeSDtor(pTask, flags);
+}
+
+bool InstallNetFesLambdaVtableGuards() noexcept {
+    if (!g_BaseAddress) return false;
+    int appliedCount = 0;
+
+    for (size_t i = 0; i < std::size(g_NetFesLambdaSpecs); ++i) {
+        auto& spec = g_NetFesLambdaSpecs[i];
+        if (spec.applied) {
+            ++appliedCount;
+            continue;
+        }
+        auto* pSlot2 = reinterpret_cast<uintptr_t*>(g_BaseAddress + spec.vtableRva + 0x10);
+        const uintptr_t expectedVa = g_BaseAddress + spec.expectedDoCallRva;
+        if (*pSlot2 != expectedVa) {
+            LogNetcode("[WARN] Vtable slot[2] mismatch for %s @ RVA 0x%llX (got 0x%llX, expected 0x%llX); skipping.",
+                       spec.name,
+                       static_cast<unsigned long long>(spec.vtableRva + 0x10),
+                       static_cast<unsigned long long>(*pSlot2),
+                       static_cast<unsigned long long>(expectedVa));
+            continue;
+        }
+
+        DWORD oldProt = 0;
+        if (VirtualProtect(pSlot2, sizeof(uintptr_t), PAGE_READWRITE, &oldProt)) {
+            spec.origDoCall = reinterpret_cast<fnNetFesLambdaDoCall_t>(expectedVa);
+            *pSlot2 = reinterpret_cast<uintptr_t>(kNetFesLambdaDetours[i]);
+            DWORD dummyProt = 0;
+            VirtualProtect(pSlot2, sizeof(uintptr_t), oldProt, &dummyProt);
+            spec.applied = true;
+            ++appliedCount;
+        }
+    }
+
+    LogNetcode("[Patch] Applied  NetFesLambdaGuards     (%d/%zu async HTTP vtables guarded: +0x0B6530B + 16 twins)",
+               appliedCount, std::size(g_NetFesLambdaSpecs));
+    return appliedCount > 0;
+}
+
+void RemoveNetFesLambdaVtableGuards() noexcept {
+    if (!g_BaseAddress) return;
+    for (auto& spec : g_NetFesLambdaSpecs) {
+        if (!spec.applied || !spec.origDoCall) continue;
+        auto* pSlot2 = reinterpret_cast<uintptr_t*>(g_BaseAddress + spec.vtableRva + 0x10);
+        DWORD oldProt = 0;
+        if (VirtualProtect(pSlot2, sizeof(uintptr_t), PAGE_READWRITE, &oldProt)) {
+            *pSlot2 = reinterpret_cast<uintptr_t>(spec.origDoCall);
+            DWORD dummyProt = 0;
+            VirtualProtect(pSlot2, sizeof(uintptr_t), oldProt, &dummyProt);
+        }
+        spec.applied = false;
+    }
 }
 
 } // namespace StormInternal

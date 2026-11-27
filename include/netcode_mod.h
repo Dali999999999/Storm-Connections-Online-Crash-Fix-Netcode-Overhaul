@@ -105,6 +105,17 @@ namespace StormRva {
     constexpr uintptr_t kNuccCs_Lock                   = 0x12A7920; // VA 0x1412A7920 (nuccCriticalSection::Lock, recursive)
     constexpr uintptr_t kNuccCs_Unlock                 = 0x12A7990; // VA 0x1412A7990 (nuccCriticalSection::Unlock)
 
+    // NetFes (ccNetEvergreenFesParamManager & ccNetFesParamManager) async HTTP callback & m_pUpdateTask UAF fixes
+    // Fixes 0xC0000005 @ NSUNSC.exe+0x00B6530B (`call qword ptr [rax + 0x20]` on dangling/freed m_pUpdateTask or manager) + 16 twin lambdas
+    constexpr uintptr_t kEvergreenFes_Ctor             = 0x0B64080; // VA 0x140B64080 .. 0x140B64649 (.pdata, size 0x5D0, m_pUpdateTask @ +0xB8)
+    constexpr uintptr_t kEvergreenFes_Dtor             = 0x0B64C40; // VA 0x140B64C40 .. 0x140B64EF5 (.pdata, ~ccNetEvergreenFesParamManager)
+    constexpr uintptr_t kNetFes_Ctor                   = 0x0B6DE00; // VA 0x140B6DE00 .. 0x140B6E266 (.pdata, size 0x4D0, m_pUpdateTask @ +0x88)
+    constexpr uintptr_t kNetFes_Dtor                   = 0x0B6E420; // VA 0x140B6E420 .. 0x140B6E6E2 (.pdata, ~ccNetFesParamManager)
+    constexpr uintptr_t kTaskCertainExe_SDtor          = 0x00B57B0; // VA 0x1400B57B0 .. 0x1400B57E4 (.pdata, ccTaskCertainExe scalar deleting dtor)
+    constexpr uintptr_t kVtbl_EvergreenFesParamMgr     = 0x1997A88; // VA 0x141997A88 (ccNetEvergreenFesParamManager vtable)
+    constexpr uintptr_t kVtbl_NetFesParamMgr           = 0x1998B18; // VA 0x141998B18 (ccNetFesParamManager vtable)
+    constexpr uintptr_t kVtbl_TaskCertainExe           = 0x1761A08; // VA 0x141761A08 (ccTaskCertainExe vtable for "ccNetFesParamManager::Update")
+
     // ccNetInputBuffer ring buffer methods (ccNetInputBuffer.cpp)
     constexpr uintptr_t kInputBuf_InsertFrameInput  = 0x10ED140; // VA 0x1410ED140 .. 0x1410ED1F1
     constexpr uintptr_t kInputBuf_Reset             = 0x10ED250; // VA 0x1410ED250 .. 0x1410ED280
@@ -379,6 +390,7 @@ struct NetcodeTelemetry {
     std::atomic<uint64_t> chatTemplateCrashSaves{0};
     std::atomic<uint64_t> spSkillOobSaves{0};
     std::atomic<uint64_t> taskManagerCrashSaves{0};
+    std::atomic<uint64_t> netFesCrashSaves{0};
 };
 
 extern HMODULE          g_hSelfModule;

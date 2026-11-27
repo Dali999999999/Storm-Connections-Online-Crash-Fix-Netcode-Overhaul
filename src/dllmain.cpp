@@ -211,7 +211,7 @@ void WriteDefaultConfigIfMissing(const std::wstring& configPath) {
     if (!out.is_open()) return;
 
     out << "; ============================================================================\n"
-        << "; NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS - Online Crash Fix & Netcode v2.9\n"
+        << "; NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS - Online Crash Fix & Netcode v2.10\n"
         << "; Reverse-Engineered & Verified (.pdata / SteamFriends017 / ccNetFreeBattleSync / D3D11 / WLAN / MMCSS)\n"
         << "; ============================================================================\n\n"
         << "[General]\n"
@@ -230,6 +230,7 @@ void WriteDefaultConfigIfMissing(const std::wstring& configPath) {
         << ";   - NSUNSC.exe+0x0702447 & +0x0702220..+0x0702310 (ccSpSkillCustomizeParam OOB spAtkIndex & ccPreSetSaveData sanitizer)\n"
         << ";   - NSUNSC.exe+0x0109C8E0 & +0x10D6740..+0x10D70E0 (ccTaskManager iterator-invalidation UAF, parallel CS lock & ccTask::Exec armor)\n"
         << ";   - NSUNSC.exe+0x0132C99B (+ 6 VFX twins) (nuccTrailForceField / VFX m_pCoord TOCTOU null-deref)\n"
+        << ";   - NSUNSC.exe+0x00B6530B (+ 16 NetFes HTTP stats twins) (ccNetEvergreenFesParamManager / ccNetFesParamManager async callback & task UAF)\n"
         << "FixOnlinePersonaCrash = 1\n"
         << "; Fixes Endless / Custom Match Lobby infinite 'Waiting...' modal deadlock\n"
         << "FixLobbyWaitDeadlock = 1\n\n"
@@ -408,7 +409,7 @@ DWORD WINAPI MainThread(LPVOID) {
         FILE* fp = nullptr;
         freopen_s(&fp, "CONOUT$", "w", stdout);
         freopen_s(&fp, "CONOUT$", "w", stderr);
-        SetConsoleTitleA("NARUTO STORM CONNECTIONS - Netcode Overhaul Engine v2.9");
+        SetConsoleTitleA("NARUTO STORM CONNECTIONS - Netcode Overhaul Engine v2.10");
     }
 
     if (g_Config.enable_console || g_LogFile) {
@@ -416,8 +417,8 @@ DWORD WINAPI MainThread(LPVOID) {
     }
 
     LogNetcode("========================================================================");
-    LogNetcode("  NARUTO X BORUTO STORM CONNECTIONS - ONLINE CRASH FIX & NETCODE v2.9   ");
-    LogNetcode("  Lobby Clone/Wait Armor + Balanced RTT + Spectator 60FPS + 60Hz Pacer ");
+    LogNetcode("  NARUTO X BORUTO STORM CONNECTIONS - ONLINE CRASH FIX & NETCODE v2.10  ");
+    LogNetcode("  Lobby/NetFes Crash Armor + Balanced RTT + Spectator 60FPS + 60Hz Pacer");
     LogNetcode("========================================================================");
     LogNetcode("[Config] OnlinePersonaCrashFix=%s | LobbyWaitFix=%s | NetcodeOverhaul=%s | LowLatencyD3D11=%s (MaxQ=%d, SchedBoost=%s, Pacer=%s, VsyncGuard=%s)",
                g_Config.fix_online_persona_crash ? "ON" : "OFF",

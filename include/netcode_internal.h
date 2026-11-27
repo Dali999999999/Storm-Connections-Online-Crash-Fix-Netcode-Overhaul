@@ -2,7 +2,7 @@
 #include "netcode_mod.h"
 
 // ============================================================================
-// Internal Shared Declarations for StormNetcode v2.9 Submodules
+// Internal Shared Declarations for StormNetcode v2.10 Submodules
 // ============================================================================
 
 namespace StormInternal {
@@ -149,6 +149,9 @@ using fnTaskMgrUpdateRange_t        = void(__fastcall*)(void* pMgr, uint32_t sta
 using fnTaskMgrUpdateSinglePar_t    = void(__fastcall*)(void* pMgr, uint32_t priority, uint32_t pauseFlag);
 using fnTaskMgrRemoveTask_t         = void(__fastcall*)(void* pMgr, void* pTask);
 using fnTaskMgrDeleteAllTasks_t     = void(__fastcall*)(void* pMgr);
+using fnNetFesMgrCtor_t             = void*(__fastcall*)(void* pThis);
+using fnNetFesMgrDtor_t             = void(__fastcall*)(void* pThis);
+using fnTaskCertainExeSDtor_t       = void*(__fastcall*)(void* pTask, uint32_t flags);
 
 extern fnCtrlBattleSync_t           oCtrlBattleSync;
 extern fnCalcNetFrameByRtt_t        oCalcNetFrameByRtt;
@@ -206,6 +209,11 @@ extern fnTaskMgrUpdateRange_t        oTaskMgrUpdateRange;
 extern fnTaskMgrUpdateSinglePar_t    oTaskMgrUpdateSinglePar;
 extern fnTaskMgrRemoveTask_t         oTaskMgrRemoveTask;
 extern fnTaskMgrDeleteAllTasks_t     oTaskMgrDeleteAllTasks;
+extern fnNetFesMgrCtor_t             oEvergreenFesCtor;
+extern fnNetFesMgrDtor_t             oEvergreenFesDtor;
+extern fnNetFesMgrCtor_t             oNetFesCtor;
+extern fnNetFesMgrDtor_t             oNetFesDtor;
+extern fnTaskCertainExeSDtor_t       oTaskCertainExeSDtor;
 
 // Module 0: Crash fixes & Byte-verified Engine Bug Patches (crash_fixes.cpp)
 const char* __fastcall hk_SteamGetFriendPersonaName(const uint64_t* pSteamId);
@@ -247,6 +255,13 @@ void        __fastcall hk_TaskMgrUpdateRange(void* pMgr, uint32_t startPrio, uin
 void        __fastcall hk_TaskMgrUpdateSingleParallel(void* pMgr, uint32_t priority, uint32_t pauseFlag);
 void        __fastcall hk_TaskMgrRemoveTask(void* pMgr, void* pTask);
 void        __fastcall hk_TaskMgrDeleteAllTasks(void* pMgr);
+void*       __fastcall hk_EvergreenFesCtor(void* pThis);
+void        __fastcall hk_EvergreenFesDtor(void* pThis);
+void*       __fastcall hk_NetFesCtor(void* pThis);
+void        __fastcall hk_NetFesDtor(void* pThis);
+void*       __fastcall hk_TaskCertainExeSDtor(void* pTask, uint32_t flags);
+bool        InstallNetFesLambdaVtableGuards() noexcept;
+void        RemoveNetFesLambdaVtableGuards() noexcept;
 void ApplyCrashAndNetcodeBytePatches(bool applyCrashPatches, bool applyNetcodePatches) noexcept;
 void RestoreVerifiedBytePatches() noexcept;
 bool InstallLobbySlotNullFixBridge();

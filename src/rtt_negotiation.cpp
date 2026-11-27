@@ -824,7 +824,7 @@ void __fastcall hk_SyncBase_RecvHostWorstRTT(void* pSyncBase, void* pArg2, uint8
                     const int32_t vanilla30FromSynth = ComputeVanillaDelayFrames(broadcastRtt, 0);
                     if (vanilla30FromSynth != hostTargetDelay && broadcastRtt == kSyntheticRttForFrames60[hostTargetDelay]) {
                         s_LoggedOutdated30FpsHost = true;
-                        LogNetcode("[WARN] Outdated Host mod sent 60FPS SyntheticRTT=%d ms (Delay=%d f) in a 30FPS match (unmodded 30FPS peers compute %d f -> desync!). Host should update to v2.9!",
+                        LogNetcode("[WARN] Outdated Host mod sent 60FPS SyntheticRTT=%d ms (Delay=%d f) in a 30FPS match (unmodded 30FPS peers compute %d f -> desync!). Host should update to v2.10!",
                                    broadcastRtt, hostTargetDelay, vanilla30FromSynth);
                     }
                 }
